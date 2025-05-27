@@ -104,13 +104,3 @@ if __name__ == "__main__":
     print(f"MAE:  {mae:.4f}")
     print(f"MSE:  {mse:.4f}")
     print(f"MAPE: {mape:.2%}")
-
-    print("🔄 Reconstructing first test sequence using inverse SWT...")
-    with torch.no_grad():
-        d_like = np.zeros_like(preds_test[0, 0].cpu().numpy())
-        reconstructed = swt_reconstruct([
-            (preds_test[0, 0].cpu().numpy(), d_like),
-            (preds_test[0, 1].cpu().numpy(), d_like),
-            (preds_test[0, 2].cpu().numpy(), d_like)
-        ])
-        print("🔬 Reconstructed forecasted sequence (1-step):", reconstructed[-1])
