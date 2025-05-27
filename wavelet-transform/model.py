@@ -45,8 +45,11 @@ class EncoderLayer(nn.Module):
 
 
 class SwtTransformerCore(nn.Module):
-    def __init__(self, input_size, time2vec_k, d_model, n_heads, d_ff, n_enc_layers, output_size):
+    def __init__(self, input_size, time2vec_k, d_model, n_heads, d_ff, n_enc_layers, forecast_steps, output_size):
         super().__init__()
+        self.forecast_steps = forecast_steps
+        self.output_size = output_size
+
         self.time2vec = Time2Vec(input_size, time2vec_k)
         self.proj = nn.Linear(time2vec_k, d_model)
 
@@ -60,10 +63,11 @@ class SwtTransformerCore(nn.Module):
             nn.Linear(d_model, d_model),
             nn.ReLU(),
             nn.Dropout(0.1),
-            nn.Linear(d_model, output_size)
+            nn.Linear(d_model, forecast_steps * output_size)
         )
 
     def forward(self, x):
+        B = x.size(0)
         x = self.time2vec(x)
         x = self.proj(x)
 
@@ -71,22 +75,22 @@ class SwtTransformerCore(nn.Module):
             x = enc_layer(x)
 
         x_out = self.global_pool(x.transpose(1, 2)).squeeze(-1)
-        return self.head(x_out)
+        x_out = self.head(x_out)  # [B, forecast_steps * output_size]
+        return x_out.view(B, self.forecast_steps, self.output_size)  # [B, forecast_steps, output_size]
 
 
 class SwtForecastingModel(nn.Module):
-    def __init__(self, num_bands, *args, **kwargs):
+    def __init__(self, num_bands, input_size, time2vec_k, d_model, n_heads, d_ff, n_enc_layers, forecast_steps, output_size):
         super().__init__()
         self.models = nn.ModuleList([
-            SwtTransformerCore(*args, **kwargs) for _ in range(num_bands)
+            SwtTransformerCore(input_size, time2vec_k, d_model, n_heads, d_ff, n_enc_layers, forecast_steps, output_size)
+            for _ in range(num_bands)
         ])
 
     def forward(self, swt_inputs):
-        # swt_inputs: list of [B, T, 1] tensors for each sub-band (A3, D1, D2, D3)
-        outputs = []
-        for model, x in zip(self.models, swt_inputs):
-            outputs.append(model(x))  # [B, 1] or [B, output_size]
-        return torch.stack(outputs, dim=1)  # [B, num_bands, output_size]
+        # swt_inputs: list of [B, T, 1] tensors for each sub-band
+        outputs = [model(x) for model, x in zip(self.models, swt_inputs)]  # list of [B, s, 1]
+        return torch.stack(outputs, dim=1) # mean over bands → [B, s, 1]
 
 
 # === SWT UTILS ===
@@ -98,3 +102,22 @@ def swt_decompose(signal_np, wavelet='db2', level=3):
 def swt_reconstruct(coeffs, wavelet='db2'):
     coeffs = list(reversed(coeffs))
     return pywt.iswt(coeffs, wavelet)
+
+class EarlyStopping:
+    def __init__(self, patience=5, min_delta=0.0):
+        self.patience = patience
+        self.min_delta = min_delta
+        self.best_loss = float('inf')
+        self.counter = 0
+        self.early_stop = False
+        self.best_state_dict = None
+
+    def __call__(self, val_loss, model):
+        if val_loss < self.best_loss - self.min_delta:
+            self.best_loss = val_loss
+            self.counter = 0
+            self.best_state_dict = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+        else:
+            self.counter += 1
+            if self.counter >= self.patience:
+                self.early_stop = True
