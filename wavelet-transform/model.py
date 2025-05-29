@@ -3,18 +3,16 @@ import torch.nn as nn
 import torch.nn.functional as F
 import pywt
 
-
 class Time2Vec(nn.Module):
-    def __init__(self, input_size, k):
-        super(Time2Vec, self).__init__()
-        self.linear = nn.Linear(input_size, 1)
-        self.periodic = nn.Linear(input_size, k - 1)
+    def __init__(self, input_dim, k):
+        super().__init__()
+        self.w0 = nn.Linear(input_dim, 1)
+        self.wp = nn.Linear(input_dim, k - 1)
 
     def forward(self, x):
-        linear_term = self.linear(x)
-        periodic_term = torch.sin(self.periodic(x))
-        return torch.cat([linear_term, periodic_term], dim=-1)
-
+        v0 = self.w0(x)
+        vp = torch.sin(self.wp(x))
+        return torch.cat([v0, vp], dim=-1)
 
 class FeedForward(nn.Module):
     def __init__(self, d_model, d_ff):
@@ -26,35 +24,59 @@ class FeedForward(nn.Module):
     def forward(self, x):
         return self.linear2(self.dropout(F.relu(self.linear1(x))))
 
-
 class EncoderLayer(nn.Module):
     def __init__(self, d_model, n_heads, d_ff):
         super().__init__()
         self.self_attn = nn.MultiheadAttention(d_model, n_heads, dropout=0.1, batch_first=True)
-        self.ff = FeedForward(d_model, d_ff)
-        self.norm1 = nn.LayerNorm(d_model)
-        self.norm2 = nn.LayerNorm(d_model)
-        self.dropout1 = nn.Dropout(0.1)
-        self.dropout2 = nn.Dropout(0.1)
+        self.dropout_attn = nn.Dropout(0.1)
+        self.norm_attn = nn.LayerNorm(d_model)
+        self.ff1 = FeedForward(d_model, d_ff)
+        self.dropout_ff1 = nn.Dropout(0.1)
+        self.norm_ff1 = nn.LayerNorm(d_model)
+        self.ff2 = FeedForward(d_model, d_ff)
+        self.dropout_ff2 = nn.Dropout(0.1)
+        self.norm_ff2 = nn.LayerNorm(d_model)
 
     def forward(self, x):
         attn_output, _ = self.self_attn(x, x, x)
-        x = self.norm1(x + self.dropout1(attn_output))
-        x = self.norm2(x + self.dropout2(self.ff(x)))
+        x = self.norm_attn(x + self.dropout_attn(attn_output))
+        ff1_output = self.ff1(x)
+        x = self.norm_ff1(x + self.dropout_ff1(ff1_output))
+        ff2_output = self.ff2(x)
+        x = self.norm_ff2(x + self.dropout_ff2(ff2_output))
         return x
 
+class DecoderLayer(nn.Module):
+    def __init__(self, d_model, n_heads, d_ff):
+        super().__init__()
+        self.self_attn = nn.MultiheadAttention(d_model, n_heads, dropout=0.1, batch_first=True)
+        self.dropout_attn = nn.Dropout(0.1)
+        self.norm_attn = nn.LayerNorm(d_model)
+        self.ff1 = FeedForward(d_model, d_ff)
+        self.dropout_ff1 = nn.Dropout(0.1)
+        self.norm_ff1 = nn.LayerNorm(d_model)
+
+    def forward(self, x):
+        attn_output, _ = self.self_attn(x, x, x)
+        x = self.norm_attn(x + self.dropout_attn(attn_output))
+        ff1_output = self.ff1(x)
+        x = self.norm_ff1(x + self.dropout_ff1(ff1_output))
+        return x
 
 class SwtTransformerCore(nn.Module):
-    def __init__(self, input_size, time2vec_k, d_model, n_heads, d_ff, n_enc_layers, forecast_steps, output_size):
+    def __init__(self, input_size, time2vec_k, d_model, n_heads, d_ff, n_enc_layers, n_dec_layers, forecast_steps, output_bands):
         super().__init__()
         self.forecast_steps = forecast_steps
-        self.output_size = output_size
+        self.output_bands = output_bands
 
         self.time2vec = Time2Vec(input_size, time2vec_k)
         self.proj = nn.Linear(time2vec_k, d_model)
 
         self.encoder_stack = nn.ModuleList([
             EncoderLayer(d_model, n_heads, d_ff) for _ in range(n_enc_layers)
+        ])
+        self.decoder_stack = nn.ModuleList([
+            DecoderLayer(d_model, n_heads, d_ff) for _ in range(n_dec_layers)
         ])
 
         self.global_pool = nn.AdaptiveAvgPool1d(1)
@@ -63,7 +85,7 @@ class SwtTransformerCore(nn.Module):
             nn.Linear(d_model, d_model),
             nn.ReLU(),
             nn.Dropout(0.1),
-            nn.Linear(d_model, forecast_steps * output_size)
+            nn.Linear(d_model, forecast_steps)
         )
 
     def forward(self, x):
@@ -73,31 +95,33 @@ class SwtTransformerCore(nn.Module):
 
         for enc_layer in self.encoder_stack:
             x = enc_layer(x)
+        for dec_layer in self.decoder_stack:
+            x = dec_layer(x)
 
         x_out = self.global_pool(x.transpose(1, 2)).squeeze(-1)
-        x_out = self.head(x_out)  # [B, forecast_steps * output_size]
-        return x_out.view(B, self.forecast_steps, self.output_size)  # [B, forecast_steps, output_size]
-
+        x_out = self.head(x_out)
+        return x_out.view(x.size(0), self.forecast_steps, 1)  # ✅ [B*N, s, bands]
 
 class SwtForecastingModel(nn.Module):
-    def __init__(self, num_bands, input_size, time2vec_k, d_model, n_heads, d_ff, n_enc_layers, forecast_steps, output_size):
+    def __init__(self, input_size, time2vec_k, d_model, n_heads, d_ff, n_enc_layers, n_dec_layers, forecast_steps, output_bands):
         super().__init__()
-        self.models = nn.ModuleList([
-            SwtTransformerCore(input_size, time2vec_k, d_model, n_heads, d_ff, n_enc_layers, forecast_steps, output_size)
-            for _ in range(num_bands)
-        ])
+        self.core = SwtTransformerCore(
+            input_size, time2vec_k, d_model, n_heads, d_ff,
+            n_enc_layers, n_dec_layers, forecast_steps, output_bands
+        )
 
-    def forward(self, swt_inputs):
-        # swt_inputs: list of [B, T, 1] tensors for each sub-band
-        outputs = [model(x) for model, x in zip(self.models, swt_inputs)]  # list of [B, s, 1]
-        return torch.stack(outputs, dim=1) # mean over bands → [B, s, 1]
+    def forward(self, x):
+        # x: [B, bands, W, 1]
+        B, bands, W, _ = x.shape
+        x = x.view(B * bands, W, 1)  # Flatten bands into batch dimension
+
+        output = self.core(x)  # [B * bands, s, 1]
+        return output.view(B, bands, self.core.forecast_steps, 1)
 
 
-# === SWT UTILS ===
 def swt_decompose(signal_np, wavelet='db2', level=3):
     coeffs = pywt.swt(signal_np, wavelet, level=level)
-    return list(reversed(coeffs))  # [(A3, D3), (A2, D2), (A1, D1)]
-
+    return list(reversed(coeffs))
 
 def swt_reconstruct(coeffs, wavelet='db2'):
     coeffs = list(reversed(coeffs))
