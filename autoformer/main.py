@@ -148,3 +148,4 @@ if __name__ == '__main__':
     print("Training complete. Evaluating on test set...")
     test_y_tensor = torch.tensor(y_test).float()
     evaluate_model(model, test_loader, test_y_tensor.numpy(), device)
+    torch.save(model.state_dict(), "model_weights.pth")
