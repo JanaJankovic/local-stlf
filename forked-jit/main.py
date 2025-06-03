@@ -134,7 +134,7 @@ def create_dataloaders(encoder_inputs, decoder_inputs, decoder_targets, batch_si
     
     # Adjust splits and dataset creation.
     total_size = encoder_inputs.shape[0]
-    train_size = int(total_size * 0.8)
+    train_size = int(total_size * 0.6)
     val_size = int(total_size * 0.1)
     test_size = total_size - train_size - val_size
 
@@ -218,44 +218,29 @@ def train_model(model, train_dataloader, val_dataloader, num_epochs=50):
         print(f'Epoch {epoch+1}/{num_epochs}, Train Loss: {train_loss/len(train_dataloader):.4f}, Val Loss: {val_loss/len(val_dataloader):.4f}')
         
         
+def evaluate_model(model, test_encoder_inputs, test_targets_tensor, scaler, horizon):
+    device = model.device
+    predictions_per_day = [[] for _ in range(horizon)]
+    true_values_per_day = [[] for _ in range(horizon)]
 
-def evaluate_model(test_encoder_inputs, test_targets_tensor, scaler):
-    """
-    Evaluates the model on the test set and collects predictions and true values.
-    Also computes MSE, MAE, and MAPE, and returns everything as a dictionary.
-    """
-    
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    
-    predictions_per_day = [[] for _ in range(7)]
-    true_values_per_day = [[] for _ in range(7)]
-    
-    # Compute predictions
-    for test_index in range(len(test_encoder_inputs) - 7):
-        print(f"Processing test sequence {test_index + 1}/{len(test_encoder_inputs) - 7}")
-        
+    for test_index in range(len(test_encoder_inputs)):
         input_sequence = test_encoder_inputs[test_index]
         true_values = test_targets_tensor[test_index].cpu().numpy().reshape(-1)
-        
-        predicted_values = make_predictions(input_sequence, true_values, device)
-        
-        # Inverse scale
+        predicted_values = make_predictions(model, input_sequence, true_values, horizon, device)
+
         predicted_values = scaler.inverse_transform(predicted_values.reshape(-1, 1)).flatten()
         true_values = scaler.inverse_transform(true_values.reshape(-1, 1)).flatten()
-        
-        # Collect predictions and truths
-        for i in range(7):
-            predictions_per_day[i].append(predicted_values[i])
-            true_values_per_day[i].append(true_values[i + 6])
 
-    # Flatten for metric calculation
+        for i in range(horizon):
+            predictions_per_day[i].append(predicted_values[i])
+            true_values_per_day[i].append(true_values[i])
+
     all_preds = np.array(predictions_per_day).flatten()
     all_true = np.array(true_values_per_day).flatten()
 
-    # Compute metrics
     mse = mean_squared_error(all_true, all_preds)
     mae = mean_absolute_error(all_true, all_preds)
-    mape = mean_absolute_percentage_error (all_true, all_preds)
+    mape = mean_absolute_percentage_error(all_true, all_preds)
 
     return {
         "predictions_per_day": predictions_per_day,
@@ -267,67 +252,27 @@ def evaluate_model(test_encoder_inputs, test_targets_tensor, scaler):
 
 
 
-def make_predictions(encoder_input, true_values, device):
+def make_predictions(model, encoder_input, true_values, horizon, device):
     input_tensor = encoder_input.clone().detach().float().to(device).unsqueeze(0)
     final_predictions = []
-    
-    #Initialize the Decoder Input.
-    fixed_dec_input = true_values[:7].reshape(-1, 1)#These are the known values for the first part of the prediction.
-   
-    #Predict Each Future Step.
-    for step in range(36, 43):
-        dec_input = fixed_dec_input.copy()
-        previous_predictions = []#This list will store the predictions made so far for earlier steps (used to refine future predictions).
-       
-        #Adjust the Decoder Input Based on Previous Predictions.
-        """
-        Refining predictions: For each future step (beyond step 36), the decoder input is adjusted based on the average of previous predictions.
-        This helps provide more accurate predictions for later steps.
-        The previous predictions are averaged and appended to the decoder input,
-        providing the model with updated information as it makes predictions further into the future.
-        """
-       
-        for prev_step in range(36, step):
-            previous_predictions.append(final_predictions[prev_step - 36])
-        if step > 36:
-            avg_prediction_36 = np.mean(previous_predictions[:step - 36])
-            dec_input = np.append(dec_input, np.array([[avg_prediction_36]]), axis=0)
-            for i in range(37, step):
-                avg_prediction_i = np.mean(previous_predictions[i - 36:step - 36])
-                dec_input = np.append(dec_input, np.array([[avg_prediction_i]]), axis=0)
-        dec_input_tensor = torch.tensor(dec_input).float().to(device).unsqueeze(0)# The adjusted decoder input is converted into a PyTorch tensor and moved to the correct device (GPU).
-        
-        # Load the model for the current step.
-        model = Transformer(
-            device=device,
-            in_dim_enc=3,
-            in_dim_dec=1,
-            d_model=512,
-            N_enc=4,
-            N_dec=4,
-            h_enc=8,
-            h_dec=8,
-            ff_hidnum=1024,
-            hid_pre=16,
-            hid_post=8,
-            dropout_pre=0.0,
-            dropout_post=0.0,
-            dropout_model=0.0,
-            attn_type='full',
-            use_checkpoint=False
-        ).to(device)
-        model.load_state_dict(torch.load(f'models/model_{step}.pth', map_location=device, weights_only=True))
-        model.eval()
-        with torch.no_grad():
-            output = model(input_tensor, dec_input_tensor)
-        prediction = output.squeeze(0).cpu().detach().numpy()[-1]
-        
-        # Clear the model from GPU memory.
-        del model
-        torch.cuda.empty_cache()
-        final_predictions.append(prediction)
-        
-    return np.array(final_predictions)
+
+    # Initialize decoder input with known values (e.g., first few true values)
+    decoder_input = true_values[:horizon].reshape(-1, 1).tolist()
+
+    for step in range(len(decoder_input), horizon):
+        previous_predictions = final_predictions.copy()
+        avg_input = np.mean(previous_predictions) if previous_predictions else 0.0
+        decoder_input.append([avg_input])
+
+    dec_input_tensor = torch.tensor(decoder_input).float().to(device).unsqueeze(0)
+
+    model.eval()
+    with torch.no_grad():
+        output = model(input_tensor, dec_input_tensor)
+
+    prediction = output.squeeze(0).cpu().detach().numpy()
+    return prediction
+
 
 def plot_results(predictions_per_day, true_values_per_day):
     """
@@ -370,65 +315,37 @@ def plot_results(predictions_per_day, true_values_per_day):
     plt.savefig('combined_plot_of_days_prediction.png', format='eps', dpi=600, bbox_extra_artists=(legend,), bbox_inches='tight')
 
 def main():
-    """
-    Main function to load data, train the model, and evaluate results.
-    """
-    
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
-    
-    # Set parameters directly.
-    directory_path = 'prepared_data.parquet'
-    encoder_seq_length = 30
-    num_epochs = 10
-    batch_size = 64
-    model_save_dir = 'models'
 
-    if not os.path.exists(model_save_dir):
-        os.makedirs(model_save_dir)
-    
-    # Load and preprocess data.
+    # Set parameters directly
+    directory_path = 'prepared_data.parquet'
+    lookback = 24
+    horizon = 24
+    num_epochs = 30
+    batch_size = 64
+    model_save_path = 'model_final.pth'
+
+    # Load and preprocess data
     final_data, daily_data, final_data_context, scaler, target_feature = load_and_preprocess_data(directory_path)
-    for step in range(36, 43):
-        decoder_output_length = step - 29  # Adjust decoder output length based on target step.
-       
-        # Create sequences for each target step.
-        encoder_inputs, decoder_inputs, decoder_targets = create_sequences(
-            final_data, daily_data, final_data_context, encoder_seq_length, decoder_output_length, target_feature)
-       
-        # Split data into train, val, test.
-        train_dataloader, val_dataloader, test_dataloader, test_encoder_inputs, test_targets_tensor = create_dataloaders(
-            encoder_inputs, decoder_inputs, decoder_targets, batch_size)
-       
-        # Define model.
-        model = define_model(device, use_checkpoint=True)
-        
-        # Train model.
-        train_model(model, train_dataloader, val_dataloader, num_epochs)
-       
-        # Save model.
-        model_save_path = os.path.join(model_save_dir, f'model_{step}.pth')
-        torch.save(model.state_dict(), model_save_path)
-        print(f"Model for target step {step} saved as '{model_save_path}'")
-        
-        # Clear the model from GPU memory.
-        del model
-        torch.cuda.empty_cache()
-    
-    # Evaluate models.
-    results = evaluate_model(test_encoder_inputs, test_targets_tensor, scaler)
-    
-    # Plot result
+    encoder_inputs, decoder_inputs, decoder_targets = create_sequences(
+        final_data, daily_data, final_data_context, lookback, horizon, target_feature)
+
+    train_dataloader, val_dataloader, test_dataloader, test_encoder_inputs, test_targets_tensor = create_dataloaders(
+        encoder_inputs, decoder_inputs, decoder_targets, batch_size)
+
+    model = define_model(device=device, use_checkpoint=True)
+    train_model(model, train_dataloader, val_dataloader, num_epochs)
+    torch.save(model.state_dict(), model_save_path)
+
+    results = evaluate_model(model, test_encoder_inputs, test_targets_tensor, scaler, horizon)
     plot_results(results['predictions_per_day'], results['true_values_per_day'])
 
-    # Assuming results is the output from evaluate_model(...)
     metrics_df = pd.DataFrame([{
         'MSE': results['mse'],
         'MAE': results['mae'],
         'MAPE': results['mape']
     }])
-
-    # Save to CSV
     metrics_df.to_csv("ji_trans_metrics.csv", index=False)
     print("Metrics saved to ji_trans_metrics.csv")
 
