@@ -240,7 +240,7 @@ def main():
     # --- Define and train model
     model = define_model(device=device, use_checkpoint=True)
     train_model(model, train_dataloader, val_dataloader, num_epochs)
-    torch.save(model.state_dict(), model_save_path)
+    torch.save(model, model_save_path)
 
     # --- Predict 
     y_pred = predict(model, test_dataloader, test_indices, len(df), device=device, scaler_dir='scalers')
@@ -269,7 +269,7 @@ def main():
         'mse': [mse],
         'mae': [mae],
         'mape': [mape]
-    }).to_csv('basic_prediction.csv', index=False)
+    }).to_csv('fixed_metrics.csv', index=False)
 
 if __name__ == '__main__':
     main()
