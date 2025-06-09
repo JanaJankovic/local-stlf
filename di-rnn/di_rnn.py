@@ -31,7 +31,7 @@ class BPNN(nn.Module):
 
     def forward(self, x):
         x = F.relu(self.fc1(x))
-        return self.fc2(x)  # [B*H, 1]
+        return F.relu(self.fc2(x))  # Final ReLU!
 
 # === Dual-Input RNN (DIRNN) ===
 class DIRNN(nn.Module):
