@@ -99,16 +99,16 @@ def prepare_powernet_data(df, target_col='vrednost', timestamp_col='ts', test_si
 
     return X_train_scaled, y_train_scaled, X_val_scaled, y_val_scaled, X_test_scaled, y_test_scaled, feature_scaler, target_scaler
 
-def build_sequence_data(X, y, lookback):
+def build_sequence_data(X, y, lookback, horizon):
     seq_x, meta_x, targets = [], [], []
-    for i in range(lookback, len(X)):
-        seq_x.append(X[i - lookback:i, 0:1])  # univariate series input
-        meta_x.append(X[i, 1:])               # static meta features (if any)
-        targets.append(y[i])
+    for i in range(lookback, len(X) - horizon + 1):
+        seq_x.append(y[i - lookback:i])               # <- past load values for LSTM
+        meta_x.append(X[i, :])                        # <- all other meta features at prediction time
+        targets.append(y[i:i + horizon].flatten())    # <- target load values
     return (
-        torch.tensor(seq_x, dtype=torch.float32),
-        torch.tensor(meta_x, dtype=torch.float32),
-        torch.tensor(targets, dtype=torch.float32)
+        torch.tensor(seq_x, dtype=torch.float32),      # [B, lookback, 1]
+        torch.tensor(meta_x, dtype=torch.float32),     # [B, meta]
+        torch.tensor(targets, dtype=torch.float32)     # [B, horizon]
     )
 
 class EarlyStopping:
@@ -251,8 +251,8 @@ if __name__ == "__main__":
     lookback = 24
     horizon = 24
 
-    seq_train, meta_train, y_train = build_sequence_data(X_train, y_train, lookback)
-    seq_val, meta_val, y_val = build_sequence_data(X_val, y_val, lookback)
+    seq_train, meta_train, y_train = build_sequence_data(X_train, y_train, lookback, horizon)
+    seq_val, meta_val, y_val = build_sequence_data(X_val, y_val, lookback, horizon)
 
     train_loader = DataLoader(TensorDataset(seq_train, meta_train, y_train), batch_size=64, shuffle=True)
     val_loader = DataLoader(TensorDataset(seq_val, meta_val, y_val), batch_size=64)
