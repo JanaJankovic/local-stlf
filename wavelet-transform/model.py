@@ -75,9 +75,14 @@ class SwtTransformerCore(nn.Module):
         self.encoder_stack = nn.ModuleList([
             EncoderLayer(d_model, n_heads, d_ff) for _ in range(n_enc_layers)
         ])
-        self.decoder_stack = nn.ModuleList([
-            DecoderLayer(d_model, n_heads, d_ff) for _ in range(n_dec_layers)
-        ])
+
+        # Page 8. - II.E. TRAINING 
+        # In our case, the goal is to forecast one step, and this does not
+        # require feeding the decoder with predicted output. Therefore, we ditch the decoder part altogether.
+        
+        # self.decoder_stack = nn.ModuleList([
+        #     DecoderLayer(d_model, n_heads, d_ff) for _ in range(n_dec_layers)
+        # ])
 
         self.global_pool = nn.AdaptiveAvgPool1d(1)
         self.head = nn.Sequential(
@@ -95,8 +100,9 @@ class SwtTransformerCore(nn.Module):
 
         for enc_layer in self.encoder_stack:
             x = enc_layer(x)
-        for dec_layer in self.decoder_stack:
-            x = dec_layer(x)
+        
+        # for dec_layer in self.decoder_stack:
+        #     x = dec_layer(x)
 
         x_out = self.global_pool(x.transpose(1, 2)).squeeze(-1)
         x_out = self.head(x_out)
@@ -128,20 +134,27 @@ def swt_reconstruct(coeffs, wavelet='db2'):
     return pywt.iswt(coeffs, wavelet)
 
 class EarlyStopping:
-    def __init__(self, patience=5, min_delta=0.0):
+    def __init__(self, patience=5, min_delta=0.0, min_epochs=0):
         self.patience = patience
         self.min_delta = min_delta
+        self.min_epochs = min_epochs
+
         self.best_loss = float('inf')
         self.counter = 0
         self.early_stop = False
         self.best_state_dict = None
+        self.epoch = 0
 
     def __call__(self, val_loss, model):
+        self.epoch += 1
+
         if val_loss < self.best_loss - self.min_delta:
             self.best_loss = val_loss
             self.counter = 0
             self.best_state_dict = {k: v.cpu().clone() for k, v in model.state_dict().items()}
         else:
-            self.counter += 1
-            if self.counter >= self.patience:
-                self.early_stop = True
+            if self.epoch > self.min_epochs:
+                self.counter += 1
+                if self.counter >= self.patience:
+                    self.early_stop = True
+
