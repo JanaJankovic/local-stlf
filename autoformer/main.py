@@ -6,19 +6,35 @@ import numpy as np
 from sklearn.preprocessing import MinMaxScaler
 from sklearn.metrics import mean_absolute_error, mean_squared_error, mean_absolute_percentage_error
 from torch.utils.data import TensorDataset, DataLoader
+import torch.optim as optim
+import csv
+import time
+import ctypes
+
 
 def load_data(load_df, weather_df):
+    # Round timestamps down to the hour
     load_df['hour'] = load_df['ts'].dt.floor('h')
+    weather_df['hour'] = weather_df['datetime'].dt.floor('h')
+
+    # Aggregate load: sum per hour
     hourly_load = load_df.groupby('hour')['vrednost'].sum().reset_index()
     hourly_load.rename(columns={'hour': 'datetime', 'vrednost': 'load_kWh'}, inplace=True)
 
-    weather_df = weather_df[['datetime', 'temperature_2m', 'relative_humidity_2m',
-                             'windspeed_10m', 'winddirection_10m', 'precipitation']]
+    # Aggregate weather: mean per hour
+    hourly_weather = weather_df.groupby('hour')[[
+        'temperature_2m', 'relative_humidity_2m',
+        'windspeed_10m', 'winddirection_10m', 'precipitation'
+    ]].mean().reset_index()
+    hourly_weather.rename(columns={'hour': 'datetime'}, inplace=True)
 
-    merged_df = pd.merge(hourly_load, weather_df, on='datetime', how='inner')
+    # Merge on hourly datetime
+    merged_df = pd.merge(hourly_load, hourly_weather, on='datetime', how='inner')
     merged_df = merged_df.sort_values('datetime').reset_index(drop=True)
-    print("Loaded and merged data.")
+
+    print("Loaded and merged data by hourly aggregation.")
     return merged_df
+
 
 def create_sequences(data, input_len=24, forecast_horizon=24):
     load_seq = []
@@ -45,49 +61,43 @@ def create_sequences(data, input_len=24, forecast_horizon=24):
         np.array(target_seq)
     )
 
-def evaluate_model(model, dataloader, y_true, device):
-    model.eval()
-    preds = []
-    with torch.no_grad():
-        for xb, wh, wf in dataloader:
-            xb, wh, wf = xb.to(device), wh.to(device), wf.to(device)
-            out = model(xb, wh, wf)[:, 0, :].cpu().numpy()
-            preds.append(out)
-    preds = np.concatenate(preds, axis=0)
-    mae = mean_absolute_error(y_true, preds)
-    rmse = np.sqrt(mean_squared_error(y_true, preds))
-    mape = mean_absolute_percentage_error(y_true, preds)
-    print("Evaluation results:")
-    print(f"MAE: {mae:.4f}, RMSE: {rmse:.4f}, MAPE: {mape:.4f}")
-    return mae, rmse, mape
 
-if __name__ == '__main__':
+def prepare_data(csv_path, seq_len, horizon, batch_size=32, val_size=0.1, test_size=0.3):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
+    # Load and merge data
     print("Loading data...")
-    df_load = pd.read_csv('mm79158.csv', parse_dates=['ts'])
+    df_load = pd.read_csv(csv_path, parse_dates=['ts'])
     df_weather = pd.read_csv('slovenia_hourly_weather.csv', parse_dates=['datetime'])
     df = load_data(df_load, df_weather)
 
+    # Split before scaling
+    n_total = len(df)
+    test_split = int((1 - test_size) * n_total)
+    val_split = int((1 - val_size) * test_split)
+
+    df_train = df[:val_split]
+    df_val = df[val_split:test_split]
+    df_test = df[test_split:]
+
+    # Fit scaler only on training data
+    features = ['load_kWh', 'temperature_2m', 'relative_humidity_2m',
+                'windspeed_10m', 'winddirection_10m', 'precipitation']
     scaler = MinMaxScaler()
-    scaled_data = scaler.fit_transform(df[['load_kWh', 'temperature_2m', 'relative_humidity_2m',
-                                           'windspeed_10m', 'winddirection_10m', 'precipitation']])
-    print("Scaled data.")
+    df_train_scaled = scaler.fit_transform(df_train[features])
+    df_val_scaled = scaler.transform(df_val[features])
+    df_test_scaled = scaler.transform(df_test[features])
 
-    split_1 = int(0.7 * len(scaled_data))
-    split_2 = int(0.9 * len(scaled_data))
-    train_data, val_data, test_data = scaled_data[:split_1], scaled_data[split_1:split_2], scaled_data[split_2:]
-    print(f"Data split into train: {len(train_data)}, val: {len(val_data)}, test: {len(test_data)}")
+    print("Data split and scaled.")
+    print(f"Train: {len(df_train)}, Val: {len(df_val)}, Test: {len(df_test)}")
 
-    seq_len = 24
-    horizon = 24
+    # Sequence creation
+    X_train_l, X_train_w_hist, X_train_w_fore, y_train = create_sequences(df_train_scaled, seq_len, horizon)
+    X_val_l, X_val_w_hist, X_val_w_fore, y_val = create_sequences(df_val_scaled, seq_len, horizon)
+    X_test_l, X_test_w_hist, X_test_w_fore, y_test = create_sequences(df_test_scaled, seq_len, horizon)
 
-    X_train_l, X_train_w_hist, X_train_w_fore, y_train = create_sequences(train_data, seq_len, horizon)
-    X_val_l, X_val_w_hist, X_val_w_fore, y_val = create_sequences(val_data, seq_len, horizon)
-    X_test_l, X_test_w_hist, X_test_w_fore, y_test = create_sequences(test_data, seq_len, horizon)
-
-    # Convert to tensors
+    # Convert to tensor datasets
     train_ds = TensorDataset(torch.tensor(X_train_l).unsqueeze(1).float(),
                              torch.tensor(X_train_w_hist).float(),
                              torch.tensor(X_train_w_fore).float(),
@@ -100,52 +110,119 @@ if __name__ == '__main__':
 
     test_ds = TensorDataset(torch.tensor(X_test_l).unsqueeze(1).float(),
                             torch.tensor(X_test_w_hist).float(),
-                            torch.tensor(X_test_w_fore).float())
+                            torch.tensor(X_test_w_fore).float(),
+                            torch.tensor(y_test).float())
 
-    train_loader = DataLoader(train_ds, batch_size=256, shuffle=False)
-    val_loader = DataLoader(val_ds, batch_size=256)
-    test_loader = DataLoader(test_ds, batch_size=256)
+    # DataLoaders
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=False, pin_memory=True)
+    val_loader = DataLoader(val_ds, batch_size=batch_size, pin_memory=True)
+    test_loader = DataLoader(test_ds, batch_size=batch_size, pin_memory=True)
 
-    C = 1
-    num_factors = X_train_w_hist.shape[2]
-    model = AutoformerForecast(in_channels=C, num_factors=num_factors, forecast_horizon=horizon).to(device)
+    return train_loader, val_loader, test_loader, scaler
 
-    optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+
+def train_model(model, train_loader, val_loader, num_epochs=50, patience=5, lr=1e-3, save_path='models/model.pth', log_path='logs/training_log.csv'):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = model.to(device)
+
     criterion = nn.MSELoss()
+    optimizer = optim.Adam(model.parameters(), lr=lr)
 
-    print("Starting training loop...")
-    epochs = 20
-    for epoch in range(epochs):
+    best_val_loss = float('inf')
+    patience_counter = 0
+
+    # Initialize CSV log file
+    with open(log_path, mode='w', newline='') as log_file:
+        writer = csv.writer(log_file)
+        writer.writerow(["timestamp", "epoch", "batch", "train_loss", "val_loss"])
+
+    for epoch in range(num_epochs):
         model.train()
-        total_loss = 0
-        for xb, wh, wf, yb in train_loader:
-            xb, wh, wf, yb = xb.to(device), wh.to(device), wf.to(device), yb.to(device)
+        train_losses = []
+
+        print(f"\nEpoch {epoch+1}/{num_epochs}")
+
+        for batch_idx, (x_load, x_weather_hist, x_weather_fore, y) in enumerate(train_loader):
+            x_load = x_load.to(device)
+            x_weather_hist = x_weather_hist.to(device)
+            x_weather_fore = x_weather_fore.to(device)
+            y = y.to(device)
+
             optimizer.zero_grad()
-            output = model(xb, wh, wf)[:, 0, :]
-            loss = criterion(output, yb)
+
+            weather_factors = x_weather_hist
+            nwp_forecast = x_weather_fore
+
+            output = model(x_load, weather_factors, nwp_forecast)
+            loss = criterion(output, y)
+
             loss.backward()
             optimizer.step()
-            total_loss += loss.item()
 
-        print(f"Epoch {epoch+1}, Train Loss = {total_loss / len(train_loader):.4f}")
+            loss_val = loss.item()
+            train_losses.append(loss_val)
+            print(f"\rBatch {batch_idx+1}/{len(train_loader)} | Loss: {loss_val:.4f}", end="", flush=True)
 
-        val_preds = []
-        val_y_all = []
+            # Log batch loss
+            with open(log_path, mode='a', newline='') as log_file:
+                writer = csv.writer(log_file)
+                writer.writerow([time.strftime("%Y-%m-%d %H:%M:%S"), epoch+1, batch_idx+1, loss_val, ""])
+
+        # Validation
         model.eval()
-        with torch.no_grad():
-            for xb, wh, wf, yb in val_loader:
-                xb, wh, wf = xb.to(device), wh.to(device), wf.to(device)
-                out = model(xb, wh, wf)[:, 0, :]
-                val_preds.append(out.cpu())
-                val_y_all.append(yb)
-        val_preds = torch.cat(val_preds).numpy()
-        val_y_all = torch.cat(val_y_all).numpy()
-        val_mae = mean_absolute_error(val_y_all, val_preds)
-        val_rmse = np.sqrt(mean_squared_error(val_y_all, val_preds))
-        val_mape = mean_absolute_percentage_error(val_y_all, val_preds)
-        print(f"Epoch {epoch+1}, Val MAE: {val_mae:.4f}, Val RMSE: {val_rmse:.4f}, Val MAPE: {val_mape:.4f}")
+        val_losses = []
 
-    print("Training complete. Evaluating on test set...")
-    test_y_tensor = torch.tensor(y_test).float()
-    evaluate_model(model, test_loader, test_y_tensor.numpy(), device)
-    torch.save(model.state_dict(), "model_weights.pth")
+        with torch.no_grad():
+            for x_load, x_weather_hist, x_weather_fore, y in val_loader:
+                x_load = x_load.to(device)
+                x_weather_hist = x_weather_hist.to(device)
+                x_weather_fore = x_weather_fore.to(device)
+                y = y.to(device)
+
+                output = model(x_load, x_weather_hist, x_weather_fore)
+                loss = criterion(output, y)
+                val_losses.append(loss.item())
+
+        avg_train_loss = np.mean(train_losses)
+        avg_val_loss = np.mean(val_losses)
+
+        # Log epoch summary with val_loss
+        with open(log_path, mode='a', newline='') as log_file:
+            writer = csv.writer(log_file)
+            writer.writerow([time.strftime("%Y-%m-%d %H:%M:%S"), epoch+1, "avg", avg_train_loss, avg_val_loss])
+
+        print(f"\nEpoch {epoch+1} Summary | Train Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f}")
+
+        # Early stopping
+        if avg_val_loss < best_val_loss:
+            best_val_loss = avg_val_loss
+            patience_counter = 0
+            torch.save(model, save_path)
+            print("  ✅ New best model saved.")
+        else:
+            patience_counter += 1
+            if patience_counter >= patience:
+                print("  ⏹️ Early stopping triggered.")
+                break
+
+    return torch.load(save_path)
+
+
+if __name__ == '__main__':
+
+    ES_CONTINUOUS = 0x80000000
+    ES_SYSTEM_REQUIRED = 0x00000001
+    ctypes.windll.kernel32.SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED)
+
+    csv_path = 'mm79158.csv'
+    seq_len = 24
+    horizon = 12
+    train_loader, val_loader, test_loader, scaler = prepare_data(csv_path, seq_len, horizon, batch_size=32)
+    model = AutoformerForecast(d_model=32, kernel_size=24, top_k=3, horizon=horizon)
+    trained_model = train_model(model, train_loader, val_loader, num_epochs=100, patience=10)
+
+    ctypes.windll.kernel32.SetThreadExecutionState(ES_CONTINUOUS)
+
+
+
+ 

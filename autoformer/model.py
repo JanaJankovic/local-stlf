@@ -16,129 +16,131 @@ class SeriesDecomposition(nn.Module):
         seasonal = x - trend
         return seasonal, trend
 
-
 class AutoCorrelation(nn.Module):
-    def __init__(self, top_k=3):
+    def __init__(self, d_model, top_k=3):
         super().__init__()
         self.top_k = top_k
+        self.query_proj = nn.Linear(d_model, d_model)
+        self.key_proj = nn.Linear(d_model, d_model)
+        self.value_proj = nn.Linear(d_model, d_model)
+        self.final_proj = nn.Linear(d_model * top_k, d_model)
 
-    def forward(self, x):
-        B, C, T = x.size()
-        fft_x = torch.fft.rfft(x, dim=-1)
-        auto_corr = torch.fft.irfft(fft_x * torch.conj(fft_x), n=T, dim=-1)
-        lags = torch.topk(auto_corr, self.top_k, dim=-1).indices
+    def forward(self, query, key, value):
+        B, C, T = query.size()
 
-        agg = torch.zeros_like(x)
-        for k in range(self.top_k):
-            lag = lags[..., k]
-            for b in range(B):
-                for c in range(C):
-                    shift = lag[b, c].item()
-                    if shift == 0:
-                        agg[b, c] += x[b, c]
-                    else:
-                        agg[b, c, shift:] += x[b, c, :-shift]
-        agg /= self.top_k
+        q = self.query_proj(query.permute(0, 2, 1)).permute(0, 2, 1)
+        k = self.key_proj(key.permute(0, 2, 1)).permute(0, 2, 1)
+        v = self.value_proj(value.permute(0, 2, 1)).permute(0, 2, 1)
+
+        fft_q = torch.fft.rfft(q, dim=-1)
+        fft_k = torch.fft.rfft(k, dim=-1)
+        auto_corr = torch.fft.irfft(fft_q * torch.conj(fft_k), n=T, dim=-1) / T
+
+        top_k = min(self.top_k, T // 2)
+        lags = torch.topk(auto_corr, top_k, dim=-1).indices  # [B, C, k]
+        weights = F.softmax(auto_corr, dim=-1)
+
+        outputs = []
+        for i in range(top_k):
+            shift = lags[..., i]  # [B, C]
+            idx = torch.arange(T, device=query.device)
+            rolled = torch.stack([torch.roll(v[b, c], int(shift[b, c]), dims=0) for b in range(B) for c in range(C)])
+            rolled = rolled.view(B, C, T)
+            weight = weights.gather(-1, shift.unsqueeze(-1)).squeeze(-1).unsqueeze(-1)  # [B, C, 1]
+            outputs.append(rolled * weight)
+
+        agg = torch.cat(outputs, dim=1)  # [B, C*top_k, T]
+        agg = self.final_proj(agg.permute(0, 2, 1)).permute(0, 2, 1)
         return agg
 
-
 class AutoformerBlock(nn.Module):
-    def __init__(self, in_channels, kernel_size=25, top_k=3):
+    def __init__(self, d_model, kernel_size=25, top_k=3):
         super().__init__()
         self.decomp = SeriesDecomposition(kernel_size)
-        self.auto_corr = AutoCorrelation(top_k)
-        self.proj = nn.Conv1d(in_channels, in_channels, kernel_size=1)
+        self.auto_corr = AutoCorrelation(d_model, top_k)
+        self.proj = nn.Linear(d_model, d_model)
 
     def forward(self, x):
+        # x shape: [B, C, T]
         seasonal, trend = self.decomp(x)
-        seasonal = self.auto_corr(seasonal)
-        return self.proj(seasonal + trend), trend, seasonal
+        # Match the full signature: Q = K = V = seasonal
+        seasonal_ac = self.auto_corr(seasonal, seasonal, seasonal)
+        # Add residual connection after auto-corr
+        seasonal = seasonal + seasonal_ac
+        # Combine seasonal + trend
+        combined = seasonal + trend
+        # Project using Linear (permute for nn.Linear)
+        combined = self.proj(combined.permute(0, 2, 1)).permute(0, 2, 1)
+        return combined, trend, seasonal
 
-
-class DecoderBlock(nn.Module):
-    def __init__(self, in_channels, d_model, forecast_horizon):
+class ScoringMechanism(nn.Module):
+    def __init__(self, d_model):
         super().__init__()
-        self.layer = nn.Sequential(
-            nn.Conv1d(in_channels, d_model, kernel_size=1),
-            nn.ReLU(),
-            nn.Conv1d(d_model, d_model * forecast_horizon, kernel_size=1)
-        )
+        self.scale = d_model ** 0.5
+        self.proj = nn.Linear(1, d_model)
 
-    def forward(self, x, forecast_horizon):
-        B, C, T = x.shape
-        out = self.layer(x)
-        try:
-            out = out.view(B, -1, forecast_horizon, T)
-            out = out[:, :, :, -1]
-            return out
-        except RuntimeError as e:
-            print("Shape mismatch:", out.shape, f"B={B}, C={C}, H={forecast_horizon}")
-            raise e
+    def forward(self, y_hat, weather_seq):
+        B, T, D = y_hat.shape
+        scores = []
 
+        for i in range(weather_seq.shape[-1]):
+            p = weather_seq[:, :, i:i+1]  # [B, T_weather, 1]
+            p_proj = self.proj(p)        # [B, T_weather, D]
 
-class MultiFactorAttention(nn.Module):
-    def __init__(self, d_model, num_factors):
+            S = torch.bmm(y_hat, p_proj.transpose(1, 2)) / self.scale  # [B, T, T_weather]
+            S = F.softmax(S, dim=-1)
+            scores.append(S)
+
+        return scores
+
+class CorrectionMechanism(nn.Module):
+    def __init__(self, d_model):
         super().__init__()
-        self.query_proj = nn.Linear(d_model, d_model)
-        self.key_proj = nn.Linear(1, d_model)  # Feature-wise scoring
-        self.value_proj = nn.Linear(1, d_model)
-        self.score_proj = nn.Linear(d_model, d_model)
         self.scale = d_model ** 0.5
 
-    def forward(self, y_hat, weather_hist, weather_fore):
-        B, H, D = y_hat.shape
-        full_weather = torch.cat([weather_hist, weather_fore], dim=1)  # [B, H_total, F]
-        F_dim = full_weather.shape[-1]
+    def forward(self, scores, weather_seq, y_hat):
+        B, T, D = y_hat.shape
+        num_features = len(scores)
+        weather_seq = weather_seq.permute(0, 2, 1)  # [B, F, T_weather]
 
-        # Aggregate each feature separately
-        weather_scores = []
-        for i in range(F_dim):
-            feature = full_weather[:, :, i:i+1]  # [B, H_total, 1]
-            K = self.key_proj(feature)
-            V = self.value_proj(feature)
+        weighted_sum = torch.stack([
+            torch.bmm(scores[i], weather_seq[:, i:i+1, :].transpose(1, 2)).squeeze(-1)
+            for i in range(num_features)
+        ], dim=-1).sum(dim=-1).unsqueeze(-1).expand(-1, -1, D)
 
-            attn = torch.bmm(self.query_proj(y_hat), K.transpose(1, 2)) / self.scale  # [B, H, H_total]
-            weight = F.softmax(attn, dim=-1)
-            corr = torch.bmm(weight, V)  # [B, H, D]
-            weather_scores.append(corr)
-
-        correction = torch.stack(weather_scores, dim=-1).sum(dim=-1)  # [B, H, D]
-        combined = self.score_proj(correction)
-        P = F.softmax(torch.sum(combined * y_hat, dim=-1, keepdim=True) / self.scale, dim=1)
-        final = torch.sum(P * y_hat, dim=1, keepdim=True)  # [B, 1, D]
-        return y_hat + final.expand_as(y_hat)
-
+        dot = torch.sum(weighted_sum * y_hat, dim=-1, keepdim=True) / self.scale  # [B, T, 1]
+        P = F.softmax(dot, dim=1)
+        corrected = y_hat + y_hat * P
+        return corrected
 
 class AutoformerForecast(nn.Module):
-    def __init__(self, in_channels=1, d_model=64, num_factors=5, top_k=3, kernel_size=25, forecast_horizon=24):
+    def __init__(self, d_model, kernel_size=25, top_k=3, horizon=24):
         super().__init__()
-        self.forecast_horizon = forecast_horizon
         self.d_model = d_model
+        self.horizon = horizon
+        self.input_proj = nn.Linear(1, d_model)
 
-        self.input_proj = nn.Linear(in_channels, d_model)
+        self.encoder = AutoformerBlock(d_model, kernel_size, top_k)
+        self.decoder_block1 = AutoformerBlock(d_model, kernel_size, top_k)
+        self.decoder_block2 = AutoformerBlock(d_model, kernel_size, top_k)
 
-        self.encoder = nn.ModuleList([
-            AutoformerBlock(d_model, kernel_size, top_k),
-            AutoformerBlock(d_model, kernel_size, top_k)
-        ])
+        self.final_decomp = SeriesDecomposition(kernel_size)
 
-        self.trend_decoder = DecoderBlock(d_model, d_model, forecast_horizon)
-        self.seasonal_decoder = DecoderBlock(d_model, d_model, forecast_horizon)
+        self.scoring = ScoringMechanism(d_model)
+        self.corrector = CorrectionMechanism(d_model)
 
-        self.mfa = MultiFactorAttention(d_model, num_factors)
+    def forward(self, load_series, weather_factors, nwp_forecast):
+        x = self.input_proj(load_series.permute(0, 2, 1)).permute(0, 2, 1)
+        enc_out, _, _ = self.encoder(x)
+        seasonal_init, trend_init = self.final_decomp(enc_out)
+        dec_out1, _, _ = self.decoder_block1(seasonal_init)
+        dec_out2, _, _ = self.decoder_block2(dec_out1)
+        dec_out = dec_out2 + trend_init
 
-    def forward(self, x, weather_hist, weather_fore):
-        B, C, T = x.shape  # [B, C=1, T]
-        x = self.input_proj(x.permute(0, 2, 1)).permute(0, 2, 1)  # project to [B, d_model, T]
+        weather_seq = torch.cat([weather_factors, nwp_forecast], dim=1)  # [B, T_weather, F]
+        scores = self.scoring(dec_out.permute(0, 2, 1), weather_seq)
+        corrected = self.corrector(scores, weather_seq, dec_out.permute(0, 2, 1))
+        return corrected[:, :self.horizon, 0]
 
-        seasonal, trend, _ = self.encoder[0](x)
-        seasonal, trend, seasonal2 = self.encoder[1](seasonal + trend)
 
-        trend_out = self.trend_decoder(trend, self.forecast_horizon)        # [B, d_model, H]
-        seasonal_out = self.seasonal_decoder(seasonal2, self.forecast_horizon)  # [B, d_model, H]
 
-        decoded = trend_out + seasonal_out                                 # [B, d_model, H]
-        decoded = decoded.permute(0, 2, 1)                                  # [B, H, d_model]
-
-        corrected = self.mfa(decoded, weather_hist, weather_fore)          # [B, H, d_model]
-        return corrected.permute(0, 2, 1)                                   # [B, d_model, H]
