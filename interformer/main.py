@@ -28,7 +28,7 @@ HYPERPARAM_SPACE = {
     "learning_rate": [1e-4, 1e-3, 1e-2],
     "clip_value": [0.1, 1, 10],
     "batch_size": [64, 128, 256],
-    "dropout": [0, 0.1, 0.3, 0.5],
+    "dropout": [0, 0.1, 0.15, 0.2],
     "d_model": [32, 64, 128],
     "num_layers": [1, 2, 4, 8],
     "num_heads": [1, 4, 8],
@@ -118,6 +118,7 @@ def train_random_search(condition_df, prediction_df, quantiles, input_len, forec
 
             for batch_idx, (x_cond, y) in enumerate(tqdm(train_loader, desc="Training")):
                 x_cond, y = x_cond.to(device), y.to(device)
+                y = y.view(-1, forecast_len)  # Ensure shape is [B, H]
                 x_pred_batch = x_pred.repeat(x_cond.size(0), 1, 1).to(device)
 
                 preds, *_ = model(x_cond, x_pred_batch)
@@ -125,7 +126,7 @@ def train_random_search(condition_df, prediction_df, quantiles, input_len, forec
 
                 optimizer.zero_grad()
                 loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), hp["clip_value"])
+                total_grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), hp["clip_value"])
                 optimizer.step()
 
                 train_loss_sum += loss.item()
@@ -139,6 +140,7 @@ def train_random_search(condition_df, prediction_df, quantiles, input_len, forec
             with torch.no_grad():
                 for x_cond, y in val_loader:
                     x_cond, y = x_cond.to(device), y.to(device)
+                    y = y.view(-1, forecast_len)
                     x_pred_batch = x_pred.repeat(x_cond.size(0), 1, 1).to(device)
                     preds, *_ = model(x_cond, x_pred_batch)
                     val_loss = pinball_loss(y, preds, quantiles)

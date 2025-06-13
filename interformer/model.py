@@ -153,16 +153,19 @@ class InterFormer(nn.Module):
         x_pred, v_pred = self.selector_pred(x_pred)
 
         # 2. Sequence modeling
-        x = torch.cat([x_cond, x_pred], dim=1)  # concat in time dim
+        x = torch.cat([x_cond, x_pred], dim=1)
         attention_logs = []
         for block in self.blocks:
             x, attn_weights = block(x)
             attention_logs.append(attn_weights)
 
-        # 3. Output
-        last = x[:, -1, :]  # [B, d]
-        out = torch.stack([proj(last) for proj in self.projection], dim=-1)  # [B, H, Q]
-        return out.transpose(1, 2), v_cond, v_pred, attention_logs
+        # 3. Multi-step quantile prediction
+        # Option: Use the last timestep's features for projection
+        seq_last = x[:, -1, :]  # [B, d_model]
+        out = torch.stack([proj(seq_last) for proj in self.projection], dim=1)  # [B, Q, H]
+        
+        return out, v_cond, v_pred, attention_logs
+
 
 
 # === Eq. 18: Pinball Loss for Quantile Regression ===
