@@ -72,7 +72,7 @@ def load_and_preprocess_data(directory_path):
     daily_data['year'] = daily_data['Date_Time'].dt.year
     scaler = RobustScaler()
     daily_data['SMA_7'] = scaler.fit_transform(daily_data[['SMA_7']])
-    joblib.dump(scaler, 'scaler.pkl')# Save scaler for future use.
+    joblib.dump(scaler, 'scalers/scaler.pkl')# Save scaler for future use.
     day_of_week_scaler = StandardScaler()
     daily_data['day_of_week'] = day_of_week_scaler.fit_transform(daily_data[['day_of_week']])
     
@@ -346,7 +346,7 @@ def main():
         'MAE': results['mae'],
         'MAPE': results['mape']
     }])
-    metrics_df.to_csv("ji_trans_metrics.csv", index=False)
+    metrics_df.to_csv("results/ji_trans_metrics.csv", index=False)
     print("Metrics saved to ji_trans_metrics.csv")
 
 

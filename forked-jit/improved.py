@@ -228,13 +228,13 @@ def main():
     horizon = 24
     num_epochs = 30
     batch_size = 64
-    model_save_path = 'model_final.pth'
+    model_save_path = 'models/model.pth'
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
 
     # --- Preprocessing and data loading
     train_dataloader, val_dataloader, test_dataloader, test_indices, df = preprocess_and_split_data(
-        'mm79158.csv', lookback, horizon, batch_size=batch_size
+        'data/mm79158.csv', lookback, horizon, batch_size=batch_size
     )
 
     # --- Define and train model
@@ -269,7 +269,7 @@ def main():
         'mse': [mse],
         'mae': [mae],
         'mape': [mape]
-    }).to_csv('fixed_metrics.csv', index=False)
+    }).to_csv('results/fixed_metrics.csv', index=False)
 
 if __name__ == '__main__':
     main()

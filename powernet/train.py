@@ -242,8 +242,8 @@ def search_powernet_hyperparams(train_loader, val_loader, input_size_lstm, input
     return best_model, best_params
 
 if __name__ == "__main__":
-    data = create_calendar_features(pd.read_csv('mm79158.csv'), 'ts')
-    wdf = preprocess_weather_data('slovenia_weather_averaged.csv')
+    data = create_calendar_features(pd.read_csv('data/mm79158.csv'), 'ts')
+    wdf = preprocess_weather_data('data/slovenia_weather_averaged.csv')
     df = join_calendar_and_weather(data, wdf, 'ts')
 
     X_train, y_train, X_val, y_val, X_test, y_test, feature_scaler, target_scaler = prepare_powernet_data(df, test_size=0.3, val_size=0.1)

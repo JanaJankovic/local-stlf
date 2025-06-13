@@ -69,7 +69,7 @@ def prepare_data(csv_path, seq_len, horizon, batch_size=32, val_size=0.1, test_s
     # Load and merge data
     print("Loading data...")
     df_load = pd.read_csv(csv_path, parse_dates=['ts'])
-    df_weather = pd.read_csv('slovenia_hourly_weather.csv', parse_dates=['datetime'])
+    df_weather = pd.read_csv('data/slovenia_hourly_weather.csv', parse_dates=['datetime'])
     df = load_data(df_load, df_weather)
 
     # Split before scaling
@@ -214,7 +214,7 @@ if __name__ == '__main__':
     ES_SYSTEM_REQUIRED = 0x00000001
     ctypes.windll.kernel32.SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED)
 
-    csv_path = 'mm79158.csv'
+    csv_path = 'data/mm79158.csv'
     seq_len = 24
     horizon = 12
     train_loader, val_loader, test_loader, scaler = prepare_data(csv_path, seq_len, horizon, batch_size=32)

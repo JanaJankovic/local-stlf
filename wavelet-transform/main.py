@@ -46,7 +46,7 @@ def safe_swt(seq, wavelet, level):
 # --- PREPARE DATA ---
 def prepare_data(args):
     # --- LOAD ORIGINAL DATA ---
-    df = pd.read_csv("mm79158.csv", parse_dates=['ts'])
+    df = pd.read_csv("data/mm79158.csv", parse_dates=['ts'])
     df.set_index('ts', inplace=True)
     raw_data = df['vrednost'].values.reshape(-1)
 
