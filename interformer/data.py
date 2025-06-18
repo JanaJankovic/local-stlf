@@ -71,108 +71,115 @@ def prepare_prediction_window(future_weather_path, holiday_path):
 
 # === Create Sliding Windows for Model ===
 def create_sliding_windows(df, input_len=336, forecast_len=48):
-    X, y = [], []
+    x_cond, x_pred, y = [], [], []
+
+    feature_columns = df.columns.tolist()
+    if 'vrednost' not in feature_columns:
+        raise ValueError("'vrednost' column must be present as the target variable.")
+
+    future_columns = [col for col in feature_columns if col != 'vrednost']
+
     for i in range(input_len, len(df) - forecast_len):
-        X_window = df.iloc[i - input_len:i].values
-        y_window = df.iloc[i:i + forecast_len]['vrednost'].values
-        X.append(X_window)
-        y.append(y_window)
-    X = np.array(X)
-    y = np.array(y)
-    print(f"✔️ Sliding windows → X shape: {X.shape}, y shape: {y.shape}")
-    return X, y
+        cond_block = df.iloc[i - input_len:i]
+        pred_block = df.iloc[i:i + forecast_len]
+        target_block = pred_block['vrednost']
+
+        x_cond.append(cond_block.values)
+        x_pred.append(pred_block[future_columns].values)
+        y.append(target_block.values)
+
+    return np.array(x_cond), np.array(x_pred), np.array(y)
+
 
 # === Dataset Split and Scaling ===
-def split_and_scale_dataset(X, y, val_ratio=0.1, test_ratio=0.3, scale=True, batch_size=128):
-    total = len(X)
+def split_and_scale_dataset(x_cond, x_pred, y, val_ratio=0.1, test_ratio=0.3, scale=True, batch_size=128):
+    total = len(x_cond)
     test_size = int(total * test_ratio)
     val_size = int(total * val_ratio)
     train_size = total - test_size - val_size
 
     print(f"📊 Dataset split → Train: {train_size}, Val: {val_size}, Test: {test_size}")
 
-    X_train, X_val, X_test = X[:train_size], X[train_size:train_size + val_size], X[-test_size:]
-    y_train, y_val, y_test = y[:train_size], y[train_size:train_size + val_size], y[-test_size:]
+    slices = {
+        "train": slice(0, train_size),
+        "val": slice(train_size, train_size + val_size),
+        "test": slice(-test_size, None)
+    }
 
-    scaler_x, scaler_y = None, None
+    data = {
+        "x_cond_train": x_cond[slices["train"]],
+        "x_pred_train": x_pred[slices["train"]],
+        "y_train": y[slices["train"]],
+        "x_cond_val": x_cond[slices["val"]],
+        "x_pred_val": x_pred[slices["val"]],
+        "y_val": y[slices["val"]],
+        "x_cond_test": x_cond[slices["test"]],
+        "x_pred_test": x_pred[slices["test"]],
+        "y_test": y[slices["test"]],
+    }
+
+    scaler_x_cond, scaler_x_pred, scaler_y = None, None, None
     if scale:
-        print("🔃 Scaling X (features) and y (forecast sequence)...")
-        n_features = X.shape[2]
+        print("🔃 Scaling features (x_cond, x_pred) and targets (y)...")
+        n_features_cond = x_cond.shape[2]
+        n_features_pred = x_pred.shape[2]
 
-        # --- Scale X ---
-        scaler_x = MinMaxScaler()
-        X_train = scaler_x.fit_transform(X_train.reshape(-1, n_features)).reshape(X_train.shape)
-        X_val   = scaler_x.transform(X_val.reshape(-1, n_features)).reshape(X_val.shape)
-        X_test  = scaler_x.transform(X_test.reshape(-1, n_features)).reshape(X_test.shape)
-
-        # --- Scale y (univariate forecast sequence) ---
+        scaler_x_cond = MinMaxScaler()
+        scaler_x_pred = MinMaxScaler()
         scaler_y = MinMaxScaler()
-        y_train = scaler_y.fit_transform(y_train.reshape(-1, 1)).reshape(y_train.shape)
-        y_val   = scaler_y.transform(y_val.reshape(-1, 1)).reshape(y_val.shape)
-        y_test  = scaler_y.transform(y_test.reshape(-1, 1)).reshape(y_test.shape)
 
-    # Convert to torch tensors
-    X_train = torch.tensor(X_train, dtype=torch.float32)
-    X_val   = torch.tensor(X_val, dtype=torch.float32)
-    X_test  = torch.tensor(X_test, dtype=torch.float32)
-    y_train = torch.tensor(y_train, dtype=torch.float32)
-    y_val   = torch.tensor(y_val, dtype=torch.float32)
-    y_test  = torch.tensor(y_test, dtype=torch.float32)
+        # Fit and transform x_cond
+        data["x_cond_train"] = scaler_x_cond.fit_transform(
+            data["x_cond_train"].reshape(-1, n_features_cond)
+        ).reshape(data["x_cond_train"].shape)
+        data["x_cond_val"] = scaler_x_cond.transform(
+            data["x_cond_val"].reshape(-1, n_features_cond)
+        ).reshape(data["x_cond_val"].shape)
+        data["x_cond_test"] = scaler_x_cond.transform(
+            data["x_cond_test"].reshape(-1, n_features_cond)
+        ).reshape(data["x_cond_test"].shape)
 
-    train_loader = DataLoader(TensorDataset(X_train, y_train), batch_size=batch_size)
-    val_loader   = DataLoader(TensorDataset(X_val, y_val), batch_size=batch_size)
-    test_loader  = DataLoader(TensorDataset(X_test, y_test), batch_size=batch_size)
+        # Fit and transform x_pred
+        data["x_pred_train"] = scaler_x_pred.fit_transform(
+            data["x_pred_train"].reshape(-1, n_features_pred)
+        ).reshape(data["x_pred_train"].shape)
+        data["x_pred_val"] = scaler_x_pred.transform(
+            data["x_pred_val"].reshape(-1, n_features_pred)
+        ).reshape(data["x_pred_val"].shape)
+        data["x_pred_test"] = scaler_x_pred.transform(
+            data["x_pred_test"].reshape(-1, n_features_pred)
+        ).reshape(data["x_pred_test"].shape)
 
-    return train_loader, val_loader, test_loader, scaler_x, scaler_y
+        # Fit and transform y
+        data["y_train"] = scaler_y.fit_transform(data["y_train"])
+        data["y_val"] = scaler_y.transform(data["y_val"])
+        data["y_test"] = scaler_y.transform(data["y_test"])
 
 
-# === Prepare Prediction Input ===
-def prepare_prediction_input(condition_df, prediction_df, input_len=336, forecast_len=48, scaler=None):
-    # Fill missing target column temporarily if scaler expects it
-    if 'vrednost' in condition_df.columns and 'vrednost' not in prediction_df.columns:
-        prediction_df = prediction_df.copy()
-        prediction_df['vrednost'] = 0.0  # dummy values for scaler
+    def make_loader(xc, xp, y):
+        return DataLoader(
+            TensorDataset(
+                torch.tensor(xc, dtype=torch.float32),
+                torch.tensor(xp, dtype=torch.float32),
+                torch.tensor(y, dtype=torch.float32)
+            ),
+            batch_size=batch_size,
+            shuffle=False
+        )
 
-    # Align feature columns
-    common_cols = condition_df.columns.intersection(prediction_df.columns)
-    condition_df = condition_df[common_cols]
-    prediction_df = prediction_df[common_cols]
+    return (
+        make_loader(data["x_cond_train"], data["x_pred_train"], data["y_train"]),
+        make_loader(data["x_cond_val"], data["x_pred_val"], data["y_val"]),
+        make_loader(data["x_cond_test"], data["x_pred_test"], data["y_test"]),
+        (scaler_x_cond, scaler_x_pred),
+        scaler_y
+    )
 
-    df_cond = condition_df.tail(input_len)
-    df_pred = prediction_df.head(forecast_len)
 
-    if df_cond.shape[0] < input_len:
-        raise ValueError(f"Need {input_len} steps in condition, got {df_cond.shape[0]}")
-    if df_pred.shape[0] < forecast_len:
-        raise ValueError(f"Need {forecast_len} steps in prediction, got {df_pred.shape[0]}")
-
-    combined = pd.concat([df_cond, df_pred])
-
-    if combined.isnull().any().any():
-        raise ValueError("NaNs detected after combining input slices.")
-
-    if scaler is not None:
-        scaled = scaler.transform(combined.values)
-
-        # Drop dummy target if it was added
-        n_features = combined.shape[1]
-        if 'vrednost' in prediction_df.columns:
-            idx_vrednost = combined.columns.get_loc('vrednost')
-            scaled = np.delete(scaled, idx_vrednost, axis=1)
-            n_features -= 1
-
-        x_cond = scaled[:input_len].reshape(1, input_len, n_features)
-        x_pred = scaled[input_len:].reshape(1, forecast_len, n_features)
-    else:
-        x_cond = df_cond.values.reshape(1, input_len, -1)
-        x_pred = df_pred.values.reshape(1, forecast_len, -1)
-
-    return torch.tensor(x_cond, dtype=torch.float32), torch.tensor(x_pred, dtype=torch.float32)
 
 # === Final All-in-One Prep ===
 def prepare_interformer_dataloaders_and_prediction(
     condition_df,
-    prediction_df,
     input_len=336,
     forecast_len=48,
     val_ratio=0.1,
@@ -180,10 +187,9 @@ def prepare_interformer_dataloaders_and_prediction(
     batch_size=128,
     scale=True
 ):
-    X, y = create_sliding_windows(condition_df, input_len=input_len, forecast_len=forecast_len)
+    x_cond, x_pred, y = create_sliding_windows(condition_df, input_len=input_len, forecast_len=forecast_len)
     train_loader, val_loader, test_loader, scaler_x, scaler_y = split_and_scale_dataset(
-        X, y, val_ratio, test_ratio, scale, batch_size
+        x_cond, x_pred, y, val_ratio, test_ratio, scale, batch_size
     )
-    x_cond_pred, x_pred = prepare_prediction_input(condition_df, prediction_df, input_len, forecast_len, scaler_x)
-    print(f"✅ Prepared all data | X_cond shape, X_pred shape: {x_cond_pred.shape, x_pred.shape}")
-    return train_loader, val_loader, test_loader, x_pred, scaler_x, scaler_y
+  
+    return train_loader, val_loader, test_loader, scaler_x, scaler_y

@@ -148,31 +148,56 @@ class InterFormer(nn.Module):
         ])
 
     def forward(self, x_cond, x_pred):
-        # 1. Local feature selection
+        # 1. Feature selection
         x_cond, v_cond = self.selector_cond(x_cond)
         x_pred, v_pred = self.selector_pred(x_pred)
 
-        # 2. Sequence modeling
-        x = torch.cat([x_cond, x_pred], dim=1)
+        # 2. Pass through transformer blocks
+        x = torch.cat([x_cond, x_pred], dim=1)  # [B, T, d_model]
         attention_logs = []
         for block in self.blocks:
             x, attn_weights = block(x)
             attention_logs.append(attn_weights)
 
-        # 3. Multi-step quantile prediction
-        # Option: Use the last timestep's features for projection
-        seq_last = x[:, -1, :]  # [B, d_model]
-        out = torch.stack([proj(seq_last) for proj in self.projection], dim=1)  # [B, Q, H]
-        
-        return out, v_cond, v_pred, attention_logs
+        # 3. Use the last hidden state to predict all H horizons
+        last_hidden = x[:, -1, :]  # [B, d_model]
 
+        # 4. Predict each quantile horizon from last_hidden → [B, H]
+        quantile_outs = []
+        for proj in self.projection:
+            out_q = proj(last_hidden)  # [B, H]
+            quantile_outs.append(out_q)
+
+        # 5. Stack across quantiles → [B, Q, H]
+        out = torch.stack(quantile_outs, dim=1)
+
+        return out, v_cond, v_pred, attention_logs
 
 
 # === Eq. 18: Pinball Loss for Quantile Regression ===
 def pinball_loss(y_true, y_pred, quantiles):
+    """
+    y_true: [B, H]
+    y_pred: [B, Q, H] or [Q, B, H]
+    """
+    # Handle y_pred shape: ensure [B, Q, H]
+    if y_pred.shape[0] == len(quantiles) and y_pred.shape[1] != len(quantiles):
+        y_pred = y_pred.permute(1, 0, 2)  # [Q, B, H] → [B, Q, H]
+
+    # Handle y_true shape
+    if y_true.ndim == 1:
+        y_true = y_true.unsqueeze(1)
+    elif y_true.ndim == 2 and y_true.size(1) == 1 and y_pred.size(2) > 1:
+        y_true = y_true.expand(-1, y_pred.size(2))
+
+    # Final safety check
+    if y_true.shape != (y_pred.size(0), y_pred.size(2)):
+        raise ValueError(f"Shape mismatch: y_true {y_true.shape} vs y_pred {y_pred.shape}")
+
     losses = []
     for i, q in enumerate(quantiles):
-        err = y_true - y_pred[:, i, :]
+        err = y_true - y_pred[:, i, :]  # [B, H]
         loss = torch.max((q - 1) * err, q * err)
         losses.append(loss)
-    return torch.mean(torch.stack(losses, dim=1))
+
+    return torch.mean(torch.stack(losses, dim=0))

@@ -56,7 +56,7 @@ class EarlyStopping:
         return self.counter >= self.patience
 
 # === Random Search Training ===
-def train_random_search(condition_df, prediction_df, quantiles, input_len, forecast_len, trials=5, epochs=30):
+def train_random_search(condition_df, quantiles, input_len, forecast_len, trials=5, epochs=30):
     os.makedirs("logs", exist_ok=True)
     os.makedirs("models", exist_ok=True)
 
@@ -64,7 +64,7 @@ def train_random_search(condition_df, prediction_df, quantiles, input_len, forec
     best_val_loss = float('inf')
 
     for trial in range(trials):
-        print(f"\n🔁 Trial {trial+1}/{trials}")
+        print(f"\n🔁 Trial {trial + 1}/{trials}")
         hp = sample_hyperparams()
         print(f"🧬 Sampled Hyperparameters: {hp}")
 
@@ -83,19 +83,22 @@ def train_random_search(condition_df, prediction_df, quantiles, input_len, forec
             csv.writer(f).writerow(["trial", "epoch", "batch", "train_loss", "val_loss"])
 
         # Data preparation
-        train_loader, val_loader, _, x_pred, _, _ = prepare_interformer_dataloaders_and_prediction(
-            condition_df, prediction_df,
-            input_len=input_len, forecast_len=forecast_len,
+        train_loader, val_loader, _, _, _ = prepare_interformer_dataloaders_and_prediction(
+            condition_df,
+            input_len=input_len,
+            forecast_len=forecast_len,
             batch_size=hp["batch_size"]
         )
 
-        X_sample = next(iter(train_loader))[0]
-        print("Train sample shape:", X_sample.shape)
-        print("Prediction input shape:", x_pred.shape)
+        # Get input shapes from one batch
+        sample_batch = next(iter(train_loader))
+        x_cond_sample, x_pred_sample, _ = sample_batch
+        print("Train x_cond shape:", x_cond_sample.shape)
+        print("Train x_pred shape:", x_pred_sample.shape)
 
         model = InterFormer(
-            num_vars_cond=X_sample.shape[2],
-            num_vars_pred=x_pred.shape[2],
+            num_vars_cond=x_cond_sample.shape[2],
+            num_vars_pred=x_pred_sample.shape[2],
             d_model=hp["d_model"],
             kernel_size=hp["kernel_size"],
             num_heads=hp["num_heads"],
@@ -111,17 +114,19 @@ def train_random_search(condition_df, prediction_df, quantiles, input_len, forec
         trial_best_loss = float('inf')
 
         for epoch in range(epochs):
-            print(f"📚 Epoch {epoch+1}/{epochs}")
+            print(f"📚 Epoch {epoch + 1}/{epochs}")
             model.train()
             train_loss_sum = 0
             train_batches = 0
 
-            for batch_idx, (x_cond, y) in enumerate(tqdm(train_loader, desc="Training")):
-                x_cond, y = x_cond.to(device), y.to(device)
-                y = y.view(-1, forecast_len)  # Ensure shape is [B, H]
-                x_pred_batch = x_pred.repeat(x_cond.size(0), 1, 1).to(device)
+            for x_cond, x_pred, y in tqdm(train_loader, desc="Training"):
+                x_cond, x_pred, y = x_cond.to(device), x_pred.to(device), y.to(device)
+                if y.ndim == 1:
+                    y = y.unsqueeze(1).expand(-1, forecast_len)
+                elif y.ndim == 2 and y.size(1) == 1:
+                    y = y.expand(-1, forecast_len)
 
-                preds, *_ = model(x_cond, x_pred_batch)
+                preds, *_ = model(x_cond, x_pred)
                 loss = pinball_loss(y, preds, quantiles)
 
                 optimizer.zero_grad()
@@ -138,25 +143,28 @@ def train_random_search(condition_df, prediction_df, quantiles, input_len, forec
             model.eval()
             val_losses = []
             with torch.no_grad():
-                for x_cond, y in val_loader:
-                    x_cond, y = x_cond.to(device), y.to(device)
-                    y = y.view(-1, forecast_len)
-                    x_pred_batch = x_pred.repeat(x_cond.size(0), 1, 1).to(device)
-                    preds, *_ = model(x_cond, x_pred_batch)
+                for x_cond, x_pred, y in val_loader:
+                    x_cond, x_pred, y = x_cond.to(device), x_pred.to(device), y.to(device)
+                    if y.ndim == 1:
+                        y = y.unsqueeze(1).expand(-1, forecast_len)
+                    elif y.ndim == 2 and y.size(1) == 1:
+                        y = y.expand(-1, forecast_len)
+
+                    preds, *_ = model(x_cond, x_pred)
                     val_loss = pinball_loss(y, preds, quantiles)
                     val_losses.append(val_loss.item())
 
-            avg_val_loss = sum(val_losses) / len(val_losses) if len(val_losses) > 0 else 0
+            avg_val_loss = sum(val_losses) / len(val_losses) if val_losses else 0
 
             print(f"✅ Training Loss: {avg_train_loss:.4f}, Validation Loss: {avg_val_loss:.4f}")
             with open(trial_logs_path, "a", newline="") as f:
-                csv.writer(f).writerow([trial+1, epoch+1, "", avg_train_loss, avg_val_loss])
+                csv.writer(f).writerow([trial + 1, epoch + 1, "", avg_train_loss, avg_val_loss])
 
             # Save best model per trial
             if avg_val_loss < trial_best_loss:
                 trial_best_loss = avg_val_loss
                 torch.save(model, trial_model_path)
-                print(f"💾 Trial {trial+1}: Saved best model to {trial_model_path}")
+                print(f"💾 Trial {trial + 1}: Saved best model to {trial_model_path}")
 
             if early_stopper.step(avg_val_loss, model):
                 print("⏹️ Early stopping triggered.")
@@ -178,18 +186,17 @@ if __name__ == "__main__":
         "data/slovenia_hourly_weather.csv",
         "data/slovenian_holidays_2016_2018.csv"
     )
+    
+    try:
+        best_model = train_random_search(
+            condition_df,
+            quantiles=QUANTILES,
+            input_len=INPUT_LEN,
+            forecast_len=FORECAST_LEN,
+            trials=TRIALS,
+            epochs=EPOCHS
+        )
 
-    prediction_df = prepare_prediction_window(
-        "data/slovenia_hourly_weather_future.csv",
-        "data/slovenian_holidays_2019_2022.csv"
-    )
-
-    best_model = train_random_search(
-        condition_df,
-        prediction_df,
-        quantiles=QUANTILES,
-        input_len=INPUT_LEN,
-        forecast_len=FORECAST_LEN,
-        trials=TRIALS,
-        epochs=EPOCHS
-    )
+    except Exception as e:
+        print(f"🔥 Exception during training batch: {e}")
+        import traceback; traceback.print_exc()
