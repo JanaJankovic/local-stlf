@@ -1,6 +1,5 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 def periodic_distance(x1, x2, period):
     diff = torch.abs(x1[:, None] - x2[None, :])
@@ -20,34 +19,29 @@ def composite_kernel(X1, X2, sigma_t=4.0, sigma_d=120.0):
     return K_t * K_d * K_c
 
 class SharedBasisFunctions(nn.Module):
-    def __init__(self, X_train, p=10, sigma_t=4.0, sigma_d=120.0, lambda_ridge=1e-3):
+    def __init__(self, X_train, p=10, sigma_t=4.0, sigma_d=120.0):
         super().__init__()
         self.register_buffer("X_train", X_train)
         self.sigma_t = sigma_t
         self.sigma_d = sigma_d
+        self.register_buffer("A", torch.empty(0))  # Will be updated later
 
-        with torch.no_grad():
-            K = composite_kernel(X_train, X_train, sigma_t, sigma_d)
-            n = K.shape[0]
-            Y_random = torch.randn(n, p)  # Simulated targets for basis
-            reg = lambda_ridge * torch.eye(n, device=K.device)
-            a = torch.linalg.solve(K + reg, Y_random)
-            self.register_buffer("a", a)
+    def build_kernel(self, X1, X2):
+        return composite_kernel(X1, X2, self.sigma_t, self.sigma_d)
 
     def forward(self, X):
-        K = composite_kernel(X, self.X_train, self.sigma_t, self.sigma_d)
-        return K @ self.a  # [B, p]
+        K = self.build_kernel(X, self.X_train)
+        return K @ self.A  # [B, p]
 
 class MultiTaskOKL(nn.Module):
-    def __init__(self, X_train, num_tasks, p=10, horizon=24, sigma_t=4.0, sigma_d=120.0, lambda_ridge=1e-3):
+    def __init__(self, X_train, num_tasks, p=10, horizon=24, sigma_t=4.0, sigma_d=120.0):
         super().__init__()
         self.horizon = horizon
         self.num_tasks = num_tasks
         self.p = p
 
-        self.shared_basis = SharedBasisFunctions(X_train, p, sigma_t, sigma_d, lambda_ridge)
-
-        self.B = torch.zeros(p, num_tasks, horizon)  # [p, T, H]
+        self.shared_basis = SharedBasisFunctions(X_train, p, sigma_t, sigma_d)
+        self.B = torch.randn(p, num_tasks, horizon) * 0.01  # good default
         self.L = torch.eye(num_tasks)                # [T, T]
 
     def compute_shared_basis(self, X):
