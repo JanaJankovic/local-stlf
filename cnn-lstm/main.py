@@ -100,6 +100,10 @@ def train_model_core(model, X_train, y_train, X_val, y_val, scaler, model_path, 
                 writer = csv.DictWriter(f, fieldnames=row.keys())
                 writer.writerow(row)
 
+        epoch_model_path = model_path.replace('.h5', f'_epoch_{epoch+1}.h5')
+        model.save(epoch_model_path)
+        print(f"💾 Saved model to {epoch_model_path}")
+
     return model
 
 
