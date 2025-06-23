@@ -3,6 +3,7 @@ from util import RMSELoss, log_full_model_metrics_per_epoch, log_training_loss
 from data import preprocess_data
 from model import DIRNN
 import time
+import os
 
 def freeze_all_except(model, component_name):
     """Freeze all parameters except the specified component."""
@@ -48,7 +49,7 @@ def validate_one_epoch(model, component_name, val_data, criterion):
 
 
 def train_component(model, component_name, x_seq, x_per, y_true, val_data,
-                    scaler, epochs, lr, device, loss_log_path,
+                    scaler, epochs, lr, loss_log_path,
                     patience=5, min_epochs=10):
     print(f"\n🧠 Training {component_name}...")
     criterion = RMSELoss()
@@ -56,7 +57,6 @@ def train_component(model, component_name, x_seq, x_per, y_true, val_data,
     optimizer = torch.optim.Adam(component.parameters(), lr=lr)
 
     best_val_loss = float('inf')
-    best_model_state = None
     patience_counter = 0
 
     for epoch in range(epochs):
@@ -71,37 +71,27 @@ def train_component(model, component_name, x_seq, x_per, y_true, val_data,
         # Log training + validation loss per epoch
         log_training_loss(loss_log_path, epoch, train_loss, val_loss, start_time, end_time)
 
-        if epoch < min_epochs:
-            continue
+        # if epoch < min_epochs:
+        #     continue
 
-        if val_loss < best_val_loss - 1e-5:
-            best_val_loss = val_loss
-            best_model_state = component.state_dict()
-            patience_counter = 0
-        else:
-            patience_counter += 1
-            if patience_counter >= patience:
-                print(f"\n⏹️ Early stopping {component_name} at epoch {epoch+1}. Best Val Loss: {best_val_loss:.6f}")
-                break
-
-    if best_model_state:
-        component.load_state_dict(best_model_state)
-
-    # Log evaluation metrics for the full model (only for bpnn)
-    if component_name == 'bpnn':
-        log_full_model_metrics_per_epoch(model, x_seq, x_per, y_true, val_data, scaler, epoch, eval_log_path="logs/train_eval.csv")
-
-
+        # if val_loss < best_val_loss - 1e-5:
+        #     best_val_loss = val_loss
+        #     patience_counter = 0
+        # else:
+        #     patience_counter += 1
+        #     if patience_counter >= patience:
+        #         print(f"\n⏹️ Early stopping {component_name} at epoch {epoch+1}. Best Val Loss: {best_val_loss:.6f}")
+        #         break
+        if component_name == 'bpnn':
+            log_full_model_metrics_per_epoch(model, x_seq, x_per, y_true, val_data, scaler, epoch, eval_log_path="logs/train_eval.csv")
+            torch.save(model, f'models/model_epoch_{epoch + 1}.pt')
+    
 def train_dirnn(model, train_data, val_data, epochs=20, lr_rnn=0.005, lr_bpnn=0.008, device='cpu', patience=5, min_epochs=10):
     print("🚂 Starting full DI-RNN training...")
     model = model.to(device)
 
     X_seq_train, X_per_train, y_train = [torch.tensor(x, dtype=torch.float32).to(device) for x in train_data]
     X_seq_val, X_per_val, y_val = [torch.tensor(x, dtype=torch.float32).to(device) for x in val_data]
-
-    print("Train target shape:", y_train.shape)
-    print("Train pred shape:  ", model(X_seq_train, X_per_train).shape)
-
     val_tensors = (X_seq_val, X_per_val, y_val)
 
     # === Train each component ===
@@ -109,7 +99,7 @@ def train_dirnn(model, train_data, val_data, epochs=20, lr_rnn=0.005, lr_bpnn=0.
         model, 's_rnn',
         X_seq_train, X_per_train, y_train, val_tensors,
         scaler=scaler,
-        epochs=epochs, lr=lr_rnn, device=device,
+        epochs=epochs, lr=lr_rnn,
         patience=patience, min_epochs=min_epochs,
         loss_log_path='logs/srnn_train_log.csv'
     )
@@ -118,7 +108,7 @@ def train_dirnn(model, train_data, val_data, epochs=20, lr_rnn=0.005, lr_bpnn=0.
         model, 'p_rnn',
         X_seq_train, X_per_train, y_train, val_tensors,
         scaler=scaler,
-        epochs=epochs, lr=lr_rnn, device=device,
+        epochs=epochs, lr=lr_rnn,
         patience=patience, min_epochs=min_epochs,
         loss_log_path='logs/prnn_train_log.csv'
     )
@@ -127,18 +117,19 @@ def train_dirnn(model, train_data, val_data, epochs=20, lr_rnn=0.005, lr_bpnn=0.
         model, 'bpnn',
         X_seq_train, X_per_train, y_train, val_tensors,
         scaler=scaler,
-        epochs=epochs, lr=lr_bpnn, device=device,
+        epochs=epochs, lr=lr_bpnn,
         patience=patience, min_epochs=min_epochs,
         loss_log_path='logs/bpnn_train_log.csv'
     )
     return model
 
+
 if __name__ == "__main__":
     device = "cpu"
     csv_path = 'data/mm79158.csv'
-    m = 24 * 14
-    n = 7
-    horizon = 1
+    m = 24 * 14 # lookback sequence 14 days
+    n = 14 # same hour past 14 days
+    horizon = 1 
     epochs = 20
 
     data, scaler, _ = preprocess_data(csv_path, m=m, n=n, freq='1h', horizon=1)
@@ -150,5 +141,4 @@ if __name__ == "__main__":
     print("🧠 Initializing DIRNN model...")
     model = DIRNN(seq_input_size=1, per_input_size=1, hidden_size=64, bp_hidden_size=128, dropout=0.2, horizon=horizon)
     train_dirnn(model, train_data, val_data, epochs=epochs, lr_rnn=0.005, lr_bpnn=0.008, patience=3, device=device, min_epochs=epochs)
-
-    torch.save(model, f"models/dirnn_model_{m}_{n}.pth")
+    

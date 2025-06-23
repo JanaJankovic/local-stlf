@@ -11,6 +11,8 @@ import os
 import pandas as pd
 import time
 from datetime import datetime
+from scipy.stats import spearmanr, ConstantInputWarning
+import warnings
 
 class RMSELoss(nn.Module):
     def __init__(self, eps=1e-8):
@@ -23,7 +25,6 @@ class RMSELoss(nn.Module):
 
 
 def calculate_metrics(y_true, y_pred, elapsed_time, type='test'):
-    # Flatten if needed
     y_true = np.array(y_true).flatten()
     y_pred = np.array(y_pred).flatten()
 
@@ -33,13 +34,16 @@ def calculate_metrics(y_true, y_pred, elapsed_time, type='test'):
     mape = mean_absolute_percentage_error(y_true, y_pred)
     r2 = r2_score(y_true, y_pred)
 
-    # MDA - Mean Directional Accuracy
     y_true_diff = np.diff(y_true)
     y_pred_diff = np.diff(y_pred)
     mda = np.mean(np.sign(y_true_diff) == np.sign(y_pred_diff))
 
-    # Spearman correlation
-    spearman_corr, _ = spearmanr(y_true, y_pred)
+    # Handle constant input warning
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", category=ConstantInputWarning)
+        spearman_corr, _ = spearmanr(y_true, y_pred)
+        if np.isnan(spearman_corr):
+            spearman_corr = 0.0  # or np.nan if you prefer
 
     return {
         'type': type,
@@ -52,7 +56,6 @@ def calculate_metrics(y_true, y_pred, elapsed_time, type='test'):
         'MDA': mda,
         'Spearman': spearman_corr
     }
-
 
 def log_training_loss(log_path, epoch, train_loss, val_loss, start_time, end_time):
     os.makedirs(os.path.dirname(log_path), exist_ok=True)
@@ -76,7 +79,11 @@ def log_evaluation_metrics(log_path, epoch, y_true, y_pred, scaler, eval_type, e
     metrics = metric_fn(y_true, y_pred, elapsed_time, type=eval_type)
     metrics["epoch"] = epoch + 1
     metrics["type"] = eval_type
-    pd.DataFrame([metrics]).to_csv(log_path, mode='a', index=False, header=not os.path.exists(log_path))
+
+    column_order = ["epoch", "type", "inference", "MAE", "MSE", "RMSE", "MAPE", "R2", "MDA", "Spearman"]
+    metrics_ordered = {key: metrics[key] for key in column_order}
+
+    pd.DataFrame([metrics_ordered]).to_csv(log_path, mode='a', index=False, header=not os.path.exists(log_path))
 
 
 def log_full_model_metrics_per_epoch(model, x_seq, x_per, y_true, val_data, scaler, epoch, eval_log_path):
@@ -99,5 +106,5 @@ def log_full_model_metrics_per_epoch(model, x_seq, x_per, y_true, val_data, scal
     pred_val_np = scaler.inverse_transform(pred_val.cpu().numpy())
 
     # Log metrics
-    log_evaluation_metrics(eval_log_path, epoch, y_true_train, pred_train_np, scaler=None, type="train", elapsed_time=t2 - t1, calculate_metrics_fn=calculate_metrics)
-    log_evaluation_metrics(eval_log_path, epoch, y_true_val, pred_val_np, scaler=None, type="val", elapsed_time=t4 - t3, calculate_metrics_fn=calculate_metrics)
+    log_evaluation_metrics(eval_log_path, epoch, y_true_train, pred_train_np, scaler=scaler, eval_type="train", elapsed_time=t2 - t1, metric_fn=calculate_metrics)
+    log_evaluation_metrics(eval_log_path, epoch, y_true_val, pred_val_np, scaler=scaler, eval_type="val", elapsed_time=t4 - t3, metric_fn=calculate_metrics)
