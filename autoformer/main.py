@@ -66,7 +66,7 @@ def validate_epoch(model, dataloader, criterion, device):
 
 
 def train_model(model, train_loader, val_loader, scaler, num_epochs=50, patience=5,
-                lr=1e-3, save_path='models/model.pt', log_path='logs/training_log.csv',
+                lr=1e-3, log_path='logs/training_log.csv',
                 eval_log_path='logs/training_eval.csv'):
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -100,16 +100,17 @@ def train_model(model, train_loader, val_loader, scaler, num_epochs=50, patience
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             patience_counter = 0
-            torch.save(model, save_path)
-            print("  ✅ New best model saved.")
         else:
             patience_counter += 1
             if patience_counter >= patience:
                 print("  ⏹️ Early stopping triggered.")
                 break
 
-    return torch.load(save_path)
+        epoch_save_path = f'models/model_{epoch + 1}.pt'
+        torch.save(model, epoch_save_path)
+        print(f"  💾 Model saved to {epoch_save_path}")
 
+    return model
 if __name__ == '__main__':
 
     ES_CONTINUOUS = 0x80000000
