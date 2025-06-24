@@ -2,15 +2,11 @@ import pandas as pd
 import numpy as np
 from sklearn.preprocessing import MinMaxScaler, StandardScaler
 from sklearn.decomposition import PCA
-import joblib
 import torch
 from torch.utils.data import TensorDataset, DataLoader
-from model import define_model
-from sklearn.metrics import mean_absolute_error, mean_squared_error, mean_absolute_percentage_error
 import torch
-from torch import nn
-import torch.optim as optim
-import matplotlib.pyplot as plt
+import joblib
+
 
 def create_encoder_decoder_sequences(input_data, target_data, context_data, encoder_seq_length, decoder_seq_length):
     encoder_inputs, decoder_inputs, decoder_targets, decoder_target_indices = [], [], [], []
@@ -35,13 +31,6 @@ def create_encoder_decoder_sequences(input_data, target_data, context_data, enco
         np.array(decoder_targets),
         np.array(decoder_target_indices)
     )
-
-def align_forecast_to_indices(y_pred, index_windows, total_len):
-    aligned = np.full(total_len, np.nan)
-    for window, idx_seq in zip(y_pred, index_windows):
-        for val, idx in zip(window, idx_seq):
-            aligned[idx] = val
-    return aligned
 
 def feature_engineering(csv_path, window_size=24):
     df = pd.read_csv(csv_path, sep=";", decimal=",", parse_dates=["ts"])
@@ -103,11 +92,12 @@ def scaling_and_pca(df, test_size=0.3, val_size=0.1):
     for split in splits:
         reduced_context[splits[split]] = pca.transform(context_scaler.transform(raw_context.loc[splits[split]]))
 
+    
     joblib.dump(scaler_target, 'scalers/scaler_target.pkl')
     joblib.dump(scaler_day, 'scalers/scaler_day.pkl')
     joblib.dump(context_scaler, 'scalers/scaler_context.pkl')
     joblib.dump(pca, 'scalers/pca.pkl')
-
+    
     return scaled_features, scaled_target, reduced_context, splits['train'], splits['val'], splits['test']
 
 def preprocess_and_split_data(csv_path, encoder_seq_length, decoder_seq_length, batch_size=32, test_size=0.3, val_size=0.1):
@@ -128,7 +118,7 @@ def preprocess_and_split_data(csv_path, encoder_seq_length, decoder_seq_length, 
     train_enc, val_enc, test_enc = split_by_index(enc_inputs)
     train_dec, val_dec, test_dec = split_by_index(dec_inputs)
     train_tgt, val_tgt, test_tgt = split_by_index(dec_targets)
-    _, _, test_target_indices = split_by_index(all_target_indices)
+    train_idx, val_idx, test_idx = split_by_index(all_target_indices)
 
     def make_loader(enc, dec, tgt):
         dataset = TensorDataset(torch.tensor(enc).float(), torch.tensor(dec).float(), torch.tensor(tgt).float())
@@ -138,138 +128,6 @@ def preprocess_and_split_data(csv_path, encoder_seq_length, decoder_seq_length, 
         make_loader(train_enc, train_dec, train_tgt),
         make_loader(val_enc, val_dec, val_tgt),
         make_loader(test_enc, test_dec, test_tgt),
-        test_target_indices,
+        (train_idx, val_idx, test_idx),
         df
     )
-
-def predict(model, test_loader, target_indices, total_len, device='cpu', scaler_dir='scalers'):
-    scaler_target = joblib.load(f'{scaler_dir}/scaler_target.pkl')
-    model.eval()
-    all_predictions = []
-
-    with torch.no_grad():
-        for enc_input, dec_input, _ in test_loader:
-            enc_input = enc_input.to(device)
-            dec_input = dec_input.to(device)
-            output = model(enc_input, dec_input)
-            all_predictions.append(output.cpu().numpy())
-
-    y_pred_scaled = np.concatenate(all_predictions, axis=0)
-    y_pred = scaler_target.inverse_transform(y_pred_scaled.reshape(-1, 1)).reshape(y_pred_scaled.shape)
-    pred_series = align_forecast_to_indices(y_pred, target_indices, total_len)
-    return pred_series
-
-
-def reconstruct_predictions(y_pred, horizon):
-    """
-    Reconstruct 1D predicted signal from windowed forecasts (y_pred shape: [num_windows * horizon])
-    """
-    y_pred = y_pred.reshape(-1, horizon)
-    
-    reconstructed = list(y_pred[0])  # take full first horizon
-    for i in range(1, len(y_pred)):
-        reconstructed.append(y_pred[i][-1])  # only append the last value of each next window
-
-    return np.array(reconstructed)
-
-
-def train_model(model, train_dataloader, val_dataloader, num_epochs=50):
-    optimizer = optim.Adam(model.parameters(), lr=0.0001)
-    criterion = nn.MSELoss()
-    device = model.device
-    model.to(device)
-
-    for epoch in range(num_epochs):
-        model.train()
-        train_loss = 0.0
-        for enc_inputs, dec_inputs, targets in train_dataloader:
-            enc_inputs = enc_inputs.to(device)
-            dec_inputs = dec_inputs.to(device)
-            targets = targets.to(device)
-            enc_inputs.requires_grad_(True)
-            dec_inputs.requires_grad_(True)
-            optimizer.zero_grad()
-            outputs = model(enc_inputs, dec_inputs)
-            targets = targets.squeeze(-1)
-            loss = criterion(outputs, targets)
-            loss.backward()
-            optimizer.step()
-            train_loss += loss.item()
-
-        val_loss = 0.0
-        model.eval()
-        with torch.no_grad():
-            for enc_inputs, dec_inputs, targets in val_dataloader:
-                enc_inputs = enc_inputs.to(device)
-                dec_inputs = dec_inputs.to(device)
-                targets = targets.to(device)
-                outputs = model(enc_inputs, dec_inputs)
-                targets = targets.squeeze(-1)
-                loss = criterion(outputs, targets)
-                val_loss += loss.item()
-
-        print(f'Epoch {epoch+1}/{num_epochs}, Train Loss: {train_loss/len(train_dataloader):.4f}, Val Loss: {val_loss/len(val_dataloader):.4f}')
-
-
-def reconstruct_predictions(y_pred, horizon):
-    """
-    Reconstruct 1D predicted signal from windowed forecasts (y_pred shape: [num_windows * horizon])
-    """
-    y_pred = y_pred.reshape(-1, horizon)
-    
-    reconstructed = list(y_pred[0])  # take full first horizon
-    for i in range(1, len(y_pred)):
-        reconstructed.append(y_pred[i][-1])  # only append the last value of each next window
-
-    return np.array(reconstructed)
-
-def main():
-    lookback = 24
-    horizon = 24
-    num_epochs = 30
-    batch_size = 64
-    model_save_path = 'models/model.pth'
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"Using device: {device}")
-
-    # --- Preprocessing and data loading
-    train_dataloader, val_dataloader, test_dataloader, test_indices, df = preprocess_and_split_data(
-        'data/mm79158.csv', lookback, horizon, batch_size=batch_size
-    )
-
-    # --- Define and train model
-    model = define_model(device=device, use_checkpoint=True)
-    train_model(model, train_dataloader, val_dataloader, num_epochs)
-    torch.save(model, model_save_path)
-
-    # --- Predict 
-    y_pred = predict(model, test_dataloader, test_indices, len(df), device=device, scaler_dir='scalers')
-    y_true = df['SMA_7'].values
-
-    # Plot
-    plt.figure(figsize=(30, 7))
-    plt.plot(y_true, label="True Values", color="blue", linewidth=0.5)
-    plt.plot(y_pred, label="Predicted Values", color="red", linewidth=0.5)
-    plt.xlabel("Timestep")
-    plt.ylabel("Value")
-    plt.title("Ground Truth vs Predicted Signal")
-    plt.legend()
-    plt.tight_layout()
-    plt.savefig("plot/true_vs_predicted.png", dpi=300, bbox_inches='tight')
-
-    # --- Evaluate and save metrics
-    y_true_1 = y_true[int(len(df)*0.7):]
-    y_pred_1 = y_pred[int(len(df)*0.7):]
-
-    mse = mean_squared_error(y_true_1, y_pred_1)
-    mae = mean_absolute_error(y_true_1, y_pred_1)
-    mape = mean_absolute_percentage_error(y_true_1, y_pred_1)
-
-    pd.DataFrame({
-        'mse': [mse],
-        'mae': [mae],
-        'mape': [mape]
-    }).to_csv('results/fixed_metrics.csv', index=False)
-
-if __name__ == '__main__':
-    main()
