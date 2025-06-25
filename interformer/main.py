@@ -5,16 +5,21 @@ import torch
 import torch.optim as optim
 from tqdm import tqdm
 from torch.utils.data import DataLoader, TensorDataset
-
+import time
 from model import InterFormer, pinball_loss
 from data import preprocess_all, prepare_prediction_window, prepare_interformer_dataloaders_and_prediction
+from util import evaluate_model
+
 
 # === Config ===
-INPUT_LEN = 24            # e.g., 1 day hourly
-FORECAST_LEN = 12         # e.g., 12 hours
+INPUT_LEN = 24 * 14            # e.g., 1 day hourly
+FORECAST_LEN = 1         # e.g., 12 hours
 QUANTILES = [0.1, 0.5, 0.9]
-TRIALS = 5
-EPOCHS = 30
+TRIALS = 20
+EPOCHS = 20
+BATCH_SIZE = 64
+LOGS_PATH = 'logs/train_log.csv'
+METRICS_PATH = 'logs/train_eval.csv'
 
 # === Device Setup ===
 print(f"CUDA available: {torch.cuda.is_available()}")
@@ -27,7 +32,7 @@ torch.autograd.set_detect_anomaly(True)
 HYPERPARAM_SPACE = {
     "learning_rate": [1e-4, 1e-3, 1e-2],
     "clip_value": [0.1, 1, 10],
-    "batch_size": [64, 128, 256],
+    "batch_size": [64], # skiping 128 and 256, because of comparability
     "dropout": [0, 0.1, 0.15, 0.2],
     "d_model": [32, 64, 128],
     "num_layers": [1, 2, 4, 8],
@@ -55,44 +60,32 @@ class EarlyStopping:
             self.counter += 1
         return self.counter >= self.patience
 
-# === Random Search Training ===
 def train_random_search(condition_df, quantiles, input_len, forecast_len, trials=5, epochs=30):
-    os.makedirs("logs", exist_ok=True)
-    os.makedirs("models", exist_ok=True)
-
     best_model = None
     best_val_loss = float('inf')
+
+    os.makedirs("logs", exist_ok=True)
+    os.makedirs("models", exist_ok=True)
 
     for trial in range(trials):
         print(f"\n🔁 Trial {trial + 1}/{trials}")
         hp = sample_hyperparams()
         print(f"🧬 Sampled Hyperparameters: {hp}")
 
-        # Paths for this trial
-        trial_model_path = (
-            f"models/model_trial{trial+1}_lr{hp['learning_rate']}_clip{hp['clip_value']}_bs{hp['batch_size']}_"
-            f"dropout{hp['dropout']}_dmodel{hp['d_model']}_layers{hp['num_layers']}_"
-            f"heads{hp['num_heads']}_kernel{hp['kernel_size']}.pth"
-        )
-        trial_logs_path = (
-            f"logs/log_trial{trial+1}_lr{hp['learning_rate']}_clip{hp['clip_value']}_bs{hp['batch_size']}_"
-            f"dropout{hp['dropout']}_dmodel{hp['d_model']}_layers{hp['num_layers']}_"
-            f"heads{hp['num_heads']}_kernel{hp['kernel_size']}.csv"
-        )
-        with open(trial_logs_path, "w", newline="") as f:
-            csv.writer(f).writerow(["trial", "epoch", "batch", "train_loss", "val_loss"])
+        # One-liner model name from hyperparams
+        model_name = f"model_" + "_".join(f"{k}{v}" for k, v in hp.items())
+        model_path = f"models/{model_name}.pt"
 
-        # Data preparation
-        train_loader, val_loader, _, _, _ = prepare_interformer_dataloaders_and_prediction(
+        # Data loaders
+        train_loader, val_loader, _, _, scaler_y = prepare_interformer_dataloaders_and_prediction(
             condition_df,
             input_len=input_len,
             forecast_len=forecast_len,
-            batch_size=hp["batch_size"]
+            batch_size=BATCH_SIZE
         )
 
-        # Get input shapes from one batch
-        sample_batch = next(iter(train_loader))
-        x_cond_sample, x_pred_sample, _ = sample_batch
+        # Input shapes for model creation
+        x_cond_sample, x_pred_sample, _ = next(iter(train_loader))
         print("Train x_cond shape:", x_cond_sample.shape)
         print("Train x_pred shape:", x_pred_sample.shape)
 
@@ -111,13 +104,13 @@ def train_random_search(condition_df, quantiles, input_len, forecast_len, trials
 
         optimizer = optim.Adam(model.parameters(), lr=hp["learning_rate"])
         early_stopper = EarlyStopping(patience=5)
-        trial_best_loss = float('inf')
 
         for epoch in range(epochs):
             print(f"📚 Epoch {epoch + 1}/{epochs}")
             model.train()
             train_loss_sum = 0
             train_batches = 0
+            start_epoch_time = time.time()
 
             for x_cond, x_pred, y in tqdm(train_loader, desc="Training"):
                 x_cond, x_pred, y = x_cond.to(device), x_pred.to(device), y.to(device)
@@ -131,14 +124,14 @@ def train_random_search(condition_df, quantiles, input_len, forecast_len, trials
 
                 optimizer.zero_grad()
                 loss.backward()
-                total_grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), hp["clip_value"])
+                torch.nn.utils.clip_grad_norm_(model.parameters(), hp["clip_value"])
                 optimizer.step()
 
                 train_loss_sum += loss.item()
                 train_batches += 1
 
             avg_train_loss = train_loss_sum / train_batches if train_batches > 0 else 0
-
+            end_epoch_time = time.time()
             # Validation
             model.eval()
             val_losses = []
@@ -157,26 +150,32 @@ def train_random_search(condition_df, quantiles, input_len, forecast_len, trials
             avg_val_loss = sum(val_losses) / len(val_losses) if val_losses else 0
 
             print(f"✅ Training Loss: {avg_train_loss:.4f}, Validation Loss: {avg_val_loss:.4f}")
-            with open(trial_logs_path, "a", newline="") as f:
-                csv.writer(f).writerow([trial + 1, epoch + 1, "", avg_train_loss, avg_val_loss])
+            
+            _, _, train_metrics = evaluate_model(model, train_loader, scaler_y, condition_df, 'train')
+            _, _, val_metrics = evaluate_model(model, val_loader, scaler_y, condition_df, 'val')
 
-            # Save best model per trial
-            if avg_val_loss < trial_best_loss:
-                trial_best_loss = avg_val_loss
-                torch.save(model, trial_model_path)
-                print(f"💾 Trial {trial + 1}: Saved best model to {trial_model_path}")
+            # Prepare CSV row
+            train_row = [model_name, epoch + 1] + [train_metrics[k] for k in ['type', 'inference', 'MAE', 'MSE', 'RMSE', 'MAPE', 'R2', 'MDA', 'Spearman']]
+            val_row = [model_name, epoch + 1] + [val_metrics[k] for k in ['type', 'inference', 'MAE', 'MSE', 'RMSE', 'MAPE', 'R2', 'MDA', 'Spearman']]
+            
+            with open(LOGS_PATH, "a", newline="") as f:
+                csv.writer(f).writerow([
+                    trial + 1,
+                    model_name,
+                    epoch + 1,
+                    avg_train_loss,
+                    avg_val_loss,
+                    time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(start_epoch_time)),
+                    time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(end_epoch_time))
+            ])
+            
+            with open(METRICS_PATH, 'a', newline='') as f:
+                csv.writer(f).writerow(train_row)
+                csv.writer(f).writerow(val_row)
 
-            if early_stopper.step(avg_val_loss, model):
-                print("⏹️ Early stopping triggered.")
-                break
-
-        # Track best model across all trials
-        if trial_best_loss < best_val_loss:
-            best_val_loss = trial_best_loss
-            best_model = model
-
-    print(f"\n🏁 Best Validation Loss across all trials: {best_val_loss:.4f}")
-    return best_model
+        # Save model after full training
+        torch.save(model, model_path)
+        print(f"💾 Saved model: {model_path}")
 
 
 # === Entry Point ===
@@ -186,7 +185,16 @@ if __name__ == "__main__":
         "data/slovenia_hourly_weather.csv",
         "data/slovenian_holidays_2016_2018.csv"
     )
-    
+
+    os.makedirs("logs", exist_ok=True)
+    os.makedirs("models", exist_ok=True)
+
+    with open(LOGS_PATH, "w", newline="") as f:
+        csv.writer(f).writerow(["trial", "model", "epoch", "train_loss", "val_loss"])
+
+    with open(METRICS_PATH, 'a', newline='') as f:
+        csv.writer(f).writerow(['model', 'epoch', 'type', 'inference', 'MAE', 'MSE', 'RMSE', 'MAPE', 'R2', 'MDA', 'Spearman'])
+
     try:
         best_model = train_random_search(
             condition_df,
