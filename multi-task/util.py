@@ -8,7 +8,8 @@ import os
 import csv
 import torch
 
-LOGS_PATH = 'logs/train_log.csv'
+LOGS_PATH = 'logs/training_log.csv'
+METRICS_PATH = 'logs/training_eval.csv'
 
 def calculate_metrics(y_true, y_pred, elapsed_time, type='test'):
     # Flatten if needed
@@ -41,50 +42,83 @@ def calculate_metrics(y_true, y_pred, elapsed_time, type='test'):
         'Spearman': spearman_corr
     }
 
-def log_loss_csv(epoch, train_loss, val_loss, task_ids):
-    write_header = not os.path.exists(LOGS_PATH)
+def log_loss_csv(epoch, start_time, end_time, train_loss, val_loss, task_ids):
     with open(LOGS_PATH, "a", newline="") as f:
         writer = csv.writer(f)
-        if write_header:
-            writer.writerow(["task_id", "epoch", "train_loss", "val_loss"])
         for task_id in task_ids:
-            writer.writerow([task_id, epoch + 1, round(train_loss, 6), round(val_loss, 6)])
+            writer.writerow([task_id, epoch + 1, start_time, end_time, round(train_loss, 6), round(val_loss, 6)])
 
 
-def evaluate_model(model, loader, device, scalers):
+def log_metrics_csv(epoch, model, loader, device, scalers, eval_type='test'):
+    _, _, metrics = evaluate_model(model, loader, device, scalers, eval_type)
+    with open(METRICS_PATH, 'a', newline='') as f:
+        writer = csv.writer(f)
+
+        for task_id, m in metrics.items():
+            writer.writerow([
+                task_id,
+                epoch + 1,
+                m['type'],
+                f"{m['inference']:.6f}",
+                f"{m['MAE']:.6f}",
+                f"{m['MSE']:.6f}",
+                f"{m['RMSE']:.6f}",
+                f"{m['MAPE']:.2f}",
+                f"{m['R2']:.4f}",
+                f"{m['MDA']:.4f}",
+                f"{m['Spearman']:.4f}"
+            ])
+
+
+def evaluate_model(model, loader, device, scalers, eval_type):
+    import time
     model.eval()
-    all_preds, all_true, all_tasks = [], [], []
+    all_X, all_y, all_task_ids = [], [], []
 
     with torch.no_grad():
         for X, y, task_ids in loader:
-            X, y, task_ids = X.to(device), y.to(device), task_ids.to(device)
-            G = model.compute_shared_basis(X)
-            preds = model.predict_with_basis(G, task_ids)
-            all_preds.append(preds.cpu())
-            all_true.append(y.cpu())
-            all_tasks.append(task_ids.cpu())
+            all_X.append(X.to(device))
+            all_y.append(y.to(device))
+            all_task_ids.append(task_ids.to(device))
 
-    all_preds = torch.cat(all_preds)
-    all_true = torch.cat(all_true)
-    all_tasks = torch.cat(all_tasks)
+    X_all = torch.cat(all_X)
+    y_all = torch.cat(all_y)
+    task_ids_all = torch.cat(all_task_ids)
 
-    mape_list, mnae_list = [], []
-    for task_id in torch.unique(all_tasks):
-        mask = (all_tasks == task_id)
-        y_true = all_true[mask].numpy()
-        y_pred = all_preds[mask].numpy()
+    metrics_by_task = {}
+    y_true_dict = {}
+    y_pred_dict = {}
 
-        scaler = scalers[int(task_id.item())]["target_scaler"]
-        y_true_orig = scaler.inverse_transform(y_true)
-        y_pred_orig = scaler.inverse_transform(y_pred)
+    for task_id in torch.unique(task_ids_all):
+        task_id_int = int(task_id.item())
+        mask = (task_ids_all == task_id)
+        X_task = X_all[mask]
+        y_task = y_all[mask]
 
-        y_true_flat = y_true_orig.reshape(-1)
-        y_pred_flat = y_pred_orig.reshape(-1)
+        start_time = time.time()
+        G_task = model.compute_shared_basis(X_task)
+        preds_task = model.predict_with_basis(G_task, task_id.repeat(len(X_task)))
+        elapsed_time = time.time() - start_time
 
-        mape = np.mean(np.abs((y_true_flat - y_pred_flat) / np.maximum(y_true_flat, 1e-3))) * 100
-        mnae = np.mean(np.abs(y_true_flat - y_pred_flat)) / np.mean(np.abs(y_true_flat))
+        y_true_np = y_task.cpu().numpy()
+        y_pred_np = preds_task.cpu().numpy()
 
-        mape_list.append(mape)
-        mnae_list.append(mnae)
+        scaler = scalers[task_id_int]["target_scaler"]
+        y_true_orig = scaler.inverse_transform(y_true_np)
+        y_pred_orig = scaler.inverse_transform(y_pred_np)
 
-    return mape_list, mnae_list
+        y_true_dict[task_id_int] = y_true_orig
+        y_pred_dict[task_id_int] = y_pred_orig
+
+        y_true_flat = y_true_orig.flatten()
+        y_pred_flat = y_pred_orig.flatten()
+
+        metrics = calculate_metrics(
+            y_true_flat,
+            y_pred_flat,
+            elapsed_time=elapsed_time,
+            type=eval_type
+        )
+        metrics_by_task[task_id_int] = metrics
+
+    return y_true_dict, y_pred_dict, metrics_by_task

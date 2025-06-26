@@ -7,25 +7,27 @@ import os
 import csv
 from model import MultiTaskOKL
 from data import load_and_preprocess, LoadDataset, split_by_task
-from util import calculate_metrics, evaluate_model, log_loss_csv
+from util import calculate_metrics, evaluate_model, log_loss_csv, log_metrics_csv
+import time
 
 # === Config ===
-INPUT_LEN = 24 * 14            # e.g., 1 day hourly
-FORECAST_LEN = 1         # e.g., 12 hours
-QUANTILES = [0.1, 0.5, 0.9]
-TRIALS = 20
+FORECAST_LEN = 1
 EPOCHS = 20
 BATCH_SIZE = 64
-LOGS_PATH = 'logs/train_log.csv'
-METRICS_PATH = 'logs/train_eval.csv'
+LOGS_PATH = 'logs/training_log.csv'
+METRICS_PATH = 'logs/training_eval.csv'
 MODEL_PATH = 'models/'
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
 def train_model(model, loader, lambda_reg, device, epoch, alternate_L=True):
     model.train()
     X_list, Y_list, T_list = [], [], []
 
-    for X, y, task_ids in loader:
+    print(f"\n[Epoch {epoch+1}] Training started")
+
+    for i, (X, y, task_ids) in enumerate(loader):
+        print(f"  [Batch {i+1}/{len(loader)}] X: {X.shape}, y: {y.shape}, tasks: {task_ids.unique().tolist()}")
         X_list.append(X)
         Y_list.append(y)
         T_list.append(task_ids)
@@ -88,15 +90,12 @@ def train_model(model, loader, lambda_reg, device, epoch, alternate_L=True):
 
 
 def run_training_pipeline(csv_path, val_ratio=0.2, test_ratio=0.2, max_epochs=100, patience=10):
-    if os.path.exists(LOGS_PATH):
-        os.remove(LOGS_PATH)
-
     df = load_and_preprocess(csv_path)
     train_df, val_df, test_df, scalers = split_by_task(df, val_ratio, test_ratio)
-
-    train_data = LoadDataset(train_df)
-    val_data = LoadDataset(val_df)
-    test_data = LoadDataset(test_df)
+    
+    train_data = LoadDataset(train_df, horizon=FORECAST_LEN)
+    val_data = LoadDataset(val_df, horizon=FORECAST_LEN)
+    test_data = LoadDataset(test_df, horizon=FORECAST_LEN)
 
     train_loader = DataLoader(train_data, batch_size=BATCH_SIZE, shuffle=False)
     val_loader = DataLoader(val_data, batch_size=BATCH_SIZE)
@@ -108,44 +107,67 @@ def run_training_pipeline(csv_path, val_ratio=0.2, test_ratio=0.2, max_epochs=10
     X_train = torch.tensor(X_train_scaled, dtype=torch.float32)
 
     num_tasks = df["task_id"].nunique()
-    model = MultiTaskOKL(X_train=X_train, num_tasks=num_tasks, p=100)
+    model = MultiTaskOKL(X_train=X_train, num_tasks=num_tasks, horizon=FORECAST_LEN, p=100)
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model.to(device)
+    model.to(DEVICE)
 
-    lambda_reg = 1e-5
-    best_val_loss = float("inf")
-    epochs_no_improve = 0
+    lambda_reg = 1e-3
+    # best_val_loss = float("inf")
+    # epochs_no_improve = 0
 
     for epoch in range(max_epochs):
-        avg_loss = train_model(model, train_loader, lambda_reg, device, epoch, alternate_L=True)
+        print(f"\n🚀 Starting Epoch {epoch+1}/{max_epochs}")
+        start_time = time.time()
+        avg_loss = train_model(model, train_loader, lambda_reg, DEVICE, epoch, alternate_L=True)
+        end_time = time.time()
+
+        print(f"✅ Finished training epoch {epoch+1} in {end_time - start_time:.2f}s. Avg loss: {avg_loss:.6f}")
+        print(f"🔍 Evaluating on validation set...")
 
         model.eval()
         val_loss = 0
         with torch.no_grad():
-            for X, y, task_ids in val_loader:
-                X, y, task_ids = X.to(device), y.to(device), task_ids.to(device)
+            for i, (X, y, task_ids) in enumerate(val_loader):
+                print(f"  [Val Batch {i+1}/{len(val_loader)}]")
+                X, y, task_ids = X.to(DEVICE), y.to(DEVICE), task_ids.to(DEVICE)
                 G = model.compute_shared_basis(X)
                 preds = model.predict_with_basis(G, task_ids)
                 val_loss += F.mse_loss(preds, y).item()
         val_loss /= len(val_loader)
 
-        log_loss_csv(epoch, avg_loss, val_loss, task_ids=range(num_tasks))
+        print(f"📉 Validation loss for epoch {epoch+1}: {val_loss:.6f}")
+        print(f"📋 Logging training/validation loss to CSV...")
 
-        if val_loss < best_val_loss - 1e-4:
-            best_val_loss = val_loss
-            epochs_no_improve = 0
-        else:
-            epochs_no_improve += 1
-            if epochs_no_improve >= patience:
-                print(f"Early stopping at epoch {epoch+1} — no improvement for {patience} epochs.")
-                break
+        log_loss_csv(
+            epoch, 
+            time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(start_time)),
+            time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(end_time)), 
+            avg_loss, 
+            val_loss, 
+            task_ids=range(num_tasks)
+        )
 
-    torch.save(model, MODEL_PATH)
-    final_mape, final_mnae = evaluate_model(model, test_loader, device, scalers)
-    print("\nFinal Evaluation on Test Set:")
-    for i, (mape, mnae) in enumerate(zip(final_mape, final_mnae)):
-        print(f"  Task {i}: MAPE = {mape:.2f}%, MNAE = {mnae:.4f}")
+        log_metrics_csv(epoch, model, train_loader, DEVICE, scalers, 'train')
+        log_metrics_csv(epoch, model, val_loader, DEVICE, scalers, 'val')
+
+        print(f"💾 Saving model for epoch {epoch+1}...")
+        torch.save(model, f"{MODEL_PATH}/model_epoch_{epoch+1}.pt")
+
+        # if val_loss < best_val_loss - 1e-4:
+        #     best_val_loss = val_loss
+        #     epochs_no_improve = 0
+        # else:
+        #     epochs_no_improve += 1
+        #     if epochs_no_improve >= patience:
+        #         print(f"Early stopping at epoch {epoch+1} — no improvement for {patience} epochs.")
+        #         break
 
 if __name__ == "__main__":
-    run_training_pipeline("data/mm79158.csv", val_ratio=0.1, test_ratio=0.1, max_epochs=EPOCHS, patience=EPOCHS)
+    with open(LOGS_PATH, "w", newline="") as f:
+        csv.writer(f).writerow(["task_id", "epoch", "epoch_start_time", "epoch_end_time", "train_loss", "val_loss"])
+
+
+    with open(METRICS_PATH, "w", newline="") as f:
+        csv.writer(f).writerow(['task_id', 'epoch', 'type', 'inference', 'MAE', 'MSE', 'RMSE', 'MAPE', 'R2', 'MDA', 'Spearman'])
+
+    run_training_pipeline("data/merged.csv", val_ratio=0.1, test_ratio=0.3, max_epochs=EPOCHS, patience=EPOCHS)
