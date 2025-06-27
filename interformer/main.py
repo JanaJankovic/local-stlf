@@ -4,7 +4,6 @@ import random
 import torch
 import torch.optim as optim
 from tqdm import tqdm
-from torch.utils.data import DataLoader, TensorDataset
 import time
 from model import InterFormer, pinball_loss
 from data import preprocess_all, prepare_prediction_window, prepare_interformer_dataloaders_and_prediction
@@ -12,14 +11,14 @@ from util import evaluate_model
 
 
 # === Config ===
-INPUT_LEN = 24 * 14            # e.g., 1 day hourly
+INPUT_LEN = 24 * 14      # e.g., 1 day hourly
 FORECAST_LEN = 1         # e.g., 12 hours
 QUANTILES = [0.1, 0.5, 0.9]
 TRIALS = 20
 EPOCHS = 20
 BATCH_SIZE = 64
-LOGS_PATH = 'logs/train_log.csv'
-METRICS_PATH = 'logs/train_eval.csv'
+LOGS_PATH = 'logs/training_log.csv'
+METRICS_PATH = 'logs/training_eval.csv'
 
 # === Device Setup ===
 print(f"CUDA available: {torch.cuda.is_available()}")
@@ -163,10 +162,10 @@ def train_random_search(condition_df, quantiles, input_len, forecast_len, trials
                     trial + 1,
                     model_name,
                     epoch + 1,
-                    avg_train_loss,
-                    avg_val_loss,
                     time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(start_epoch_time)),
-                    time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(end_epoch_time))
+                    time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(end_epoch_time)),
+                    avg_train_loss,
+                    avg_val_loss
             ])
             
             with open(METRICS_PATH, 'a', newline='') as f:
@@ -190,9 +189,9 @@ if __name__ == "__main__":
     os.makedirs("models", exist_ok=True)
 
     with open(LOGS_PATH, "w", newline="") as f:
-        csv.writer(f).writerow(["trial", "model", "epoch", "train_loss", "val_loss"])
+        csv.writer(f).writerow(["trial", "model", "epoch", "epoch_start_time", "epoch_end_time", "train_loss", "val_loss"])
 
-    with open(METRICS_PATH, 'a', newline='') as f:
+    with open(METRICS_PATH, 'w', newline='') as f:
         csv.writer(f).writerow(['model', 'epoch', 'type', 'inference', 'MAE', 'MSE', 'RMSE', 'MAPE', 'R2', 'MDA', 'Spearman'])
 
     try:
