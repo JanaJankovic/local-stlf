@@ -3,16 +3,19 @@ import torch.nn as nn
 import torch.nn.functional as F
 import pywt
 
+
 class Time2Vec(nn.Module):
+    # Paper Eq. 3: Time2Vec(τ)[i] = ωiτ + φi (i=0), = periodic(ωiτ + φi) (i>=1)
     def __init__(self, input_dim, k):
         super().__init__()
         self.w0 = nn.Linear(input_dim, 1)
         self.wp = nn.Linear(input_dim, k - 1)
 
     def forward(self, x):
-        v0 = self.w0(x)
-        vp = torch.sin(self.wp(x))
+        v0 = self.w0(x)  # Linear for i=0
+        vp = torch.sin(self.wp(x))  # Sin for i>=1 (sinusoidal periodic)
         return torch.cat([v0, vp], dim=-1)
+
 
 class FeedForward(nn.Module):
     def __init__(self, d_model, d_ff):
@@ -24,12 +27,18 @@ class FeedForward(nn.Module):
     def forward(self, x):
         return self.linear2(self.dropout(F.relu(self.linear1(x))))
 
+
 class EncoderLayer(nn.Module):
     def __init__(self, d_model, n_heads, d_ff):
         super().__init__()
-        self.self_attn = nn.MultiheadAttention(d_model, n_heads, dropout=0.1, batch_first=True)
+        # Multihead self-attention (Paper Eq. 1,2): Q, K, V, h heads
+        self.self_attn = nn.MultiheadAttention(
+            d_model, n_heads, dropout=0.1, batch_first=True
+        )
         self.dropout_attn = nn.Dropout(0.1)
         self.norm_attn = nn.LayerNorm(d_model)
+
+        # "two feedforward layers" per Sec II.B
         self.ff1 = FeedForward(d_model, d_ff)
         self.dropout_ff1 = nn.Dropout(0.1)
         self.norm_ff1 = nn.LayerNorm(d_model)
@@ -46,10 +55,13 @@ class EncoderLayer(nn.Module):
         x = self.norm_ff2(x + self.dropout_ff2(ff2_output))
         return x
 
+
 class DecoderLayer(nn.Module):
     def __init__(self, d_model, n_heads, d_ff):
         super().__init__()
-        self.self_attn = nn.MultiheadAttention(d_model, n_heads, dropout=0.1, batch_first=True)
+        self.self_attn = nn.MultiheadAttention(
+            d_model, n_heads, dropout=0.1, batch_first=True
+        )
         self.dropout_attn = nn.Dropout(0.1)
         self.norm_attn = nn.LayerNorm(d_model)
         self.ff1 = FeedForward(d_model, d_ff)
@@ -63,8 +75,20 @@ class DecoderLayer(nn.Module):
         x = self.norm_ff1(x + self.dropout_ff1(ff1_output))
         return x
 
+
 class SwtTransformerCore(nn.Module):
-    def __init__(self, input_size, time2vec_k, d_model, n_heads, d_ff, n_enc_layers, n_dec_layers, forecast_steps, output_bands):
+    def __init__(
+        self,
+        input_size,
+        time2vec_k,
+        d_model,
+        n_heads,
+        d_ff,
+        n_enc_layers,
+        n_dec_layers,
+        forecast_steps,
+        output_bands,
+    ):
         super().__init__()
         self.forecast_steps = forecast_steps
         self.output_bands = output_bands
@@ -72,14 +96,14 @@ class SwtTransformerCore(nn.Module):
         self.time2vec = Time2Vec(input_size, time2vec_k)
         self.proj = nn.Linear(time2vec_k, d_model)
 
-        self.encoder_stack = nn.ModuleList([
-            EncoderLayer(d_model, n_heads, d_ff) for _ in range(n_enc_layers)
-        ])
+        self.encoder_stack = nn.ModuleList(
+            [EncoderLayer(d_model, n_heads, d_ff) for _ in range(n_enc_layers)]
+        )
 
-        # Page 8. - II.E. TRAINING 
+        # Page 8. - II.E. TRAINING
         # In our case, the goal is to forecast one step, and this does not
         # require feeding the decoder with predicted output. Therefore, we ditch the decoder part altogether.
-        
+
         # self.decoder_stack = nn.ModuleList([
         #     DecoderLayer(d_model, n_heads, d_ff) for _ in range(n_dec_layers)
         # ])
@@ -90,7 +114,7 @@ class SwtTransformerCore(nn.Module):
             nn.Linear(d_model, d_model),
             nn.ReLU(),
             nn.Dropout(0.1),
-            nn.Linear(d_model, forecast_steps)
+            nn.Linear(d_model, forecast_steps),
         )
 
     def forward(self, x):
@@ -100,7 +124,7 @@ class SwtTransformerCore(nn.Module):
 
         for enc_layer in self.encoder_stack:
             x = enc_layer(x)
-        
+
         # for dec_layer in self.decoder_stack:
         #     x = dec_layer(x)
 
@@ -108,12 +132,31 @@ class SwtTransformerCore(nn.Module):
         x_out = self.head(x_out)
         return x_out.view(x.size(0), self.forecast_steps, 1)  # ✅ [B*N, s, bands]
 
+
 class SwtForecastingModel(nn.Module):
-    def __init__(self, input_size, time2vec_k, d_model, n_heads, d_ff, n_enc_layers, n_dec_layers, forecast_steps, output_bands):
+    def __init__(
+        self,
+        input_size,
+        time2vec_k,
+        d_model,
+        n_heads,
+        d_ff,
+        n_enc_layers,
+        n_dec_layers,
+        forecast_steps,
+        output_bands,
+    ):
         super().__init__()
         self.core = SwtTransformerCore(
-            input_size, time2vec_k, d_model, n_heads, d_ff,
-            n_enc_layers, n_dec_layers, forecast_steps, output_bands
+            input_size,
+            time2vec_k,
+            d_model,
+            n_heads,
+            d_ff,
+            n_enc_layers,
+            n_dec_layers,
+            forecast_steps,
+            output_bands,
         )
 
     def forward(self, x):
@@ -125,13 +168,15 @@ class SwtForecastingModel(nn.Module):
         return output.view(B, bands, self.core.forecast_steps, 1)
 
 
-def swt_decompose(signal_np, wavelet='db2', level=3):
+def swt_decompose(signal_np, wavelet="db2", level=3):
     coeffs = pywt.swt(signal_np, wavelet, level=level)
     return list(reversed(coeffs))
 
-def swt_reconstruct(coeffs, wavelet='db2'):
+
+def swt_reconstruct(coeffs, wavelet="db2"):
     coeffs = list(reversed(coeffs))
     return pywt.iswt(coeffs, wavelet)
+
 
 class EarlyStopping:
     def __init__(self, patience=5, min_delta=0.0, min_epochs=0):
@@ -139,7 +184,7 @@ class EarlyStopping:
         self.min_delta = min_delta
         self.min_epochs = min_epochs
 
-        self.best_loss = float('inf')
+        self.best_loss = float("inf")
         self.counter = 0
         self.early_stop = False
         self.best_state_dict = None
@@ -151,10 +196,11 @@ class EarlyStopping:
         if val_loss < self.best_loss - self.min_delta:
             self.best_loss = val_loss
             self.counter = 0
-            self.best_state_dict = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+            self.best_state_dict = {
+                k: v.cpu().clone() for k, v in model.state_dict().items()
+            }
         else:
             if self.epoch > self.min_epochs:
                 self.counter += 1
                 if self.counter >= self.patience:
                     self.early_stop = True
-
