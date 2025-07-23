@@ -15,24 +15,36 @@ class LocalVariableSelection(nn.Module):
     def __init__(self, num_vars, d_model, kernel_size):
         super().__init__()
         self.num_vars = num_vars
-        self.convs = nn.ModuleList([
-            nn.Conv1d(1, d_model, kernel_size=kernel_size, padding=kernel_size - 1)
-            for _ in range(num_vars)
-        ])
+        # For each input variable, create a 1D conv filter (Eq. 2 in the paper).
+        # This extracts local contextual information for each variable.
+        self.convs = nn.ModuleList(
+            [
+                nn.Conv1d(1, d_model, kernel_size=kernel_size, padding=kernel_size - 1)
+                for _ in range(num_vars)
+            ]
+        )
+        # Linear layer for scoring local states (Eq. 3).
         self.linear = nn.Linear(d_model, 1)
 
     def forward(self, x):
         # x: [B, T, N] → conv needs [B, 1, T] per variable
+        # (Eq. 2): Prepare data as [B, N, T] so each variable can be processed independently.
         x = x.permute(0, 2, 1)  # [B, N, T]
         local_states = []
 
+        # (Eq. 2): For each variable, apply 1D convolution to get local context state.
         for i, conv in enumerate(self.convs):
-            v = x[:, i:i + 1, :]  # [B, 1, T]
-            out = conv(v)[:, :, :x.size(-1)]  # crop extra padding
+            v = x[:, i : i + 1, :]  # [B, 1, T]
+            out = conv(v)[:, :, : x.size(-1)]  # crop extra padding
             local_states.append(out.permute(0, 2, 1))  # [B, T, d]
 
+        # Stack all variables' local states together (see paragraph after Eq. 2)
         local_states = torch.stack(local_states, dim=2)  # [B, T, N, d]
+
+        # (Eq. 3): Compute raw variable importance scores via linear layer
         scores = self.linear(local_states).squeeze(-1)  # [B, T, N]
+
+        # Monitoring statistics for debugging/interpretability
         min_score = scores.min().item()
         max_score = scores.max().item()
         mean_score = scores.mean().item()
@@ -40,11 +52,15 @@ class LocalVariableSelection(nn.Module):
 
         if torch.isnan(scores).any() or std_score < 1e-6:
             print("⚠️ Unstable attention scores detected:")
-            print(f"  → min: {min_score:.6f}, max: {max_score:.6f}, mean: {mean_score:.6f}, std: {std_score:.6f}")
-            print(f"  → Raw score slice (scores[0, 0, :]): {scores[0, 0, :].detach().cpu().numpy()}")
+            print(
+                f"  → min: {min_score:.6f}, max: {max_score:.6f}, mean: {mean_score:.6f}, std: {std_score:.6f}"
+            )
+            print(
+                f"  → Raw score slice (scores[0, 0, :]): {scores[0, 0, :].detach().cpu().numpy()}"
+            )
 
-        # === Numerical safety for entmax15 ===
-        # Clamp extreme values
+        # Numerical safety for entmax15, as suggested in implementation section
+        # Clamp extreme values for stable entmax (see Eq. 4 and related discussion)
         scores = scores.clamp(min=-10, max=10)
 
         # Add small noise to avoid ties / zero-variance
@@ -52,11 +68,11 @@ class LocalVariableSelection(nn.Module):
         noise = eps * torch.randn_like(scores)
         scores = scores + noise
 
-        # Sparse attention
+        # (Eq. 4): Compute sparse variable importance weights using α-entmax
         weights = entmax15(scores, dim=-1)  # [B, T, N]
+        # (Eq. 6): Weighted sum over variables, giving feature vector for each timestep
         weighted = (local_states * weights.unsqueeze(-1)).sum(dim=2)  # [B, T, d]
         return weighted, weights
-
 
 
 # === Section 3.2: Sparse Multi-Head Attention with Causal Masking ===
@@ -67,46 +83,59 @@ class SparseMultiheadAttention(nn.Module):
         self.num_heads = num_heads
         self.dk = d_model // num_heads
 
+        # Linear projections for Q, K, V as in Eq. (7)
         self.W_Q = nn.Linear(d_model, d_model)
         self.W_K = nn.Linear(d_model, d_model)
         self.W_V = nn.Linear(d_model, d_model)
-        self.W_O = nn.Linear(self.dk, d_model)
+        # Output projection as in Eq. (10)
+        self.W_O = nn.Linear(d_model, d_model)
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, x):
         B, T, _ = x.size()
-        Q = self.W_Q(x).view(B, T, self.num_heads, self.dk).transpose(1, 2)  # [B, H, T, d_k]
+        # Eq. (7): Compute Q, K, V for each head
+        Q = (
+            self.W_Q(x).view(B, T, self.num_heads, self.dk).transpose(1, 2)
+        )  # [B, H, T, d_k]
         K = self.W_K(x).view(B, T, self.num_heads, self.dk).transpose(1, 2)
         V = self.W_V(x).view(B, T, self.num_heads, self.dk).transpose(1, 2)
 
-        scores = torch.matmul(Q, K.transpose(-2, -1)) / (self.dk ** 0.5)  # [B, H, T, T]
+        # Eq. (8): Calculate attention scores (scaled dot-product)
+        scores = torch.matmul(Q, K.transpose(-2, -1)) / (self.dk**0.5)  # [B, H, T, T]
+        # Apply causal mask for autoregressive decoding, as described after Eq. (9)
+        # Page 4. -> Sequence masking [24] is applied to sparse multi-head attention layer to preserve causal information flow.
         mask = torch.triu(torch.ones(T, T, device=x.device), diagonal=1).bool()
-        scores = scores.masked_fill(mask[None, None, :, :], float('-inf'))
+        scores = scores.masked_fill(mask[None, None, :, :], float("-inf"))
 
+        # Eq. (8): Use α-entmax for sparse self-attention instead of softmax
         weights = entmax15(scores, dim=-1)  # [B, H, T, T]
-        weights = self.dropout(weights)  # Dropout on attention weights (optional)
+        weights = self.dropout(weights)
         weights_avg = weights.mean(dim=1)  # [B, T, T]
 
-        V_combined = V.mean(dim=1)  # mean over heads → [B, T, d_k]
-        out = torch.matmul(weights_avg, V_combined)  # [B, T, d_k]
-        return self.W_O(out), weights_avg  # [B, T, d_model], attention
+        # Eq. (9): Apply averaged attention to values for each head, then project/concat
+        V_cat = V.reshape(B, self.num_heads, T, self.dk)
+        # Apply weights_avg to each head's V, then concatenate all heads, or sum as needed
+        out_heads = []
+        for h in range(self.num_heads):
+            out_h = torch.matmul(weights_avg, V_cat[:, h, :, :])  # [B, T, d_k]
+            out_heads.append(out_h)
+        out = torch.cat(out_heads, dim=-1)  # [B, T, d_model]
+
+        return self.W_O(out), weights_avg
 
 
-# === Eq. 11–12: Feedforward Network with Residual & Normalization ===
+# === Eq. 11: Feedforward Network with Residual & Normalization ===
 class FeedForward(nn.Module):
     def __init__(self, d_model, d_ff, dropout=0.0):
         super().__init__()
         self.linear1 = nn.Linear(d_model, d_ff)
         self.linear2 = nn.Linear(d_ff, d_model)
-        self.norm = nn.LayerNorm(d_model)
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, x):
-        residual = x
         x = F.relu(self.linear1(x))
         x = self.dropout(x)
-        x = self.linear2(x)
-        return self.norm(x + residual)
+        return self.linear2(x)
 
 
 # === InterFormer Block: Sparse Attention + FFN + Norm ===
@@ -114,20 +143,37 @@ class InterFormerBlock(nn.Module):
     def __init__(self, d_model, d_ff, num_heads, dropout=0.0):
         super().__init__()
         self.attn = SparseMultiheadAttention(d_model, num_heads, dropout)
+        self.norm1 = nn.LayerNorm(d_model)  # After attention
         self.ffn = FeedForward(d_model, d_ff, dropout)
-        self.norm = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)  # After feedforward
 
     def forward(self, x):
+        # Multi-head attention sublayer with residual connection + norm
+        # Eq. 12
         attn_out, attn_weights = self.attn(x)
-        x = self.norm(x + attn_out)
-        x = self.ffn(x)
+        x = self.norm1(x + attn_out)
+
+        # Feed forward sublayer with residual connection + norm
+        ffn_out = self.ffn(x)
+        x = self.norm2(x + ffn_out)
         return x, attn_weights
 
 
 # === Eq. 14–16: Final InterFormer Architecture ===
 class InterFormer(nn.Module):
-    def __init__(self, num_vars_cond, num_vars_pred, d_model, kernel_size,
-                 num_heads, d_ff, num_layers, horizon, quantiles, dropout=0.0):
+    def __init__(
+        self,
+        num_vars_cond,
+        num_vars_pred,
+        d_model,
+        kernel_size,
+        num_heads,
+        d_ff,
+        num_layers,
+        horizon,
+        quantiles,
+        dropout=0.0,
+    ):
         super().__init__()
         self.quantiles = quantiles
         self.horizon = horizon
@@ -137,15 +183,17 @@ class InterFormer(nn.Module):
         self.selector_pred = LocalVariableSelection(num_vars_pred, d_model, kernel_size)
 
         # Transformer encoder blocks
-        self.blocks = nn.ModuleList([
-            InterFormerBlock(d_model, d_ff, num_heads, dropout)
-            for _ in range(num_layers)
-        ])
+        self.blocks = nn.ModuleList(
+            [
+                InterFormerBlock(d_model, d_ff, num_heads, dropout)
+                for _ in range(num_layers)
+            ]
+        )
 
         # Output projections: one per quantile
-        self.projection = nn.ModuleList([
-            nn.Linear(d_model, horizon) for _ in quantiles
-        ])
+        self.projection = nn.ModuleList(
+            [nn.Linear(d_model, horizon) for _ in quantiles]
+        )
 
     def forward(self, x_cond, x_pred):
         # 1. Feature selection
@@ -192,7 +240,9 @@ def pinball_loss(y_true, y_pred, quantiles):
 
     # Final safety check
     if y_true.shape != (y_pred.size(0), y_pred.size(2)):
-        raise ValueError(f"Shape mismatch: y_true {y_true.shape} vs y_pred {y_pred.shape}")
+        raise ValueError(
+            f"Shape mismatch: y_true {y_true.shape} vs y_pred {y_pred.shape}"
+        )
 
     losses = []
     for i, q in enumerate(quantiles):
