@@ -1,173 +1,301 @@
 import torch
-import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader
-import pandas as pd
 import numpy as np
+import pandas as pd
 import os
 import csv
-from model import MultiTaskOKL
-from data import load_and_preprocess, LoadDataset, split_by_task
-from util import calculate_metrics, evaluate_model, log_loss_csv, log_metrics_csv
 import time
+import random
+from model import MultiTaskOKL
+from data import load_and_preprocess, split_by_task
+from util import (
+    calculate_metrics,
+    save_predictions_per_task,
+    fit_scalers_per_task,
+    inverse_transform_per_task,
+)
 
 # === Config ===
-FORECAST_LEN = 1
-EPOCHS = 20
-BATCH_SIZE = 64
-LOGS_PATH = 'logs/training_log.csv'
-METRICS_PATH = 'logs/training_eval.csv'
-MODEL_PATH = 'models/'
+METRICS_PATH = "logs/training_eval.csv"
+MODEL_PATH = "models/"
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+N_RANDOM_SEARCH = 20  # Number of random search iterations
 
 
-def train_model(model, loader, lambda_reg, device, epoch, alternate_L=True):
-    model.train()
-    X_list, Y_list, T_list = [], [], []
+def calculate_metrics_per_task(y_true, y_pred, task_ids, elapsed_time):
+    unique_tasks = np.unique(task_ids)
+    all_metrics = []
+    metric_keys = ["MAE", "MSE", "RMSE", "MAPE", "R2"]
+    for task in unique_tasks:
+        idx = task_ids == task
+        metrics = calculate_metrics(y_true[idx], y_pred[idx])
+        metrics["task_id"] = task
+        metrics["time"] = (
+            elapsed_time  # Optional: if you want to keep it, but do NOT average this
+        )
+        all_metrics.append(metrics)
+    # Macro-average: average each numeric metric across tasks
+    avg_metrics = {k: np.mean([m[k] for m in all_metrics]) for k in metric_keys}
+    # Optional: add avg elapsed time if needed
+    avg_metrics["time"] = elapsed_time
+    return avg_metrics, all_metrics
 
-    print(f"\n[Epoch {epoch+1}] Training started")
 
-    for i, (X, y, task_ids) in enumerate(loader):
-        print(f"  [Batch {i+1}/{len(loader)}] X: {X.shape}, y: {y.shape}, tasks: {task_ids.unique().tolist()}")
-        X_list.append(X)
-        Y_list.append(y)
-        T_list.append(task_ids)
-
-    X = torch.cat(X_list).to(device)
-    Y = torch.cat(Y_list).to(device)
-    T = torch.cat(T_list).to(device)
-
-    print(f"\n=== Epoch {epoch+1} ===")
-    print(f"X.shape: {X.shape}, Y.shape: {Y.shape}, T.shape: {T.shape}")
-
-    num_tasks, p, H = model.num_tasks, model.p, Y.size(1)
-
-    # Step 1: Build Kernel and compute A
-    K = model.shared_basis.build_kernel(X, model.shared_basis.X_train)
-    print(f"Kernel K shape: {K.shape}, mean: {K.mean().item():.4f}, std: {K.std().item():.4f}")
-
+def fit_multitask_model(X, y, task_ids, num_tasks, params):
+    model = MultiTaskOKL(
+        X_train=X,
+        num_tasks=num_tasks,
+        horizon=1,
+        p=params["p"],
+        sigma_t=params["sigma_t"],
+        sigma_d=params["sigma_d"],
+    )
+    model.to(DEVICE)
+    if y.ndim == 1:
+        y = y.unsqueeze(1)
+    K = model.shared_basis.build_kernel(X, X)
+    T = task_ids
+    num_tasks, p, H = model.num_tasks, model.p, y.size(1)
     T_full = torch.zeros(K.shape[0], num_tasks * H, device=K.device)
     for j in range(num_tasks):
-        mask = (T == j)
-        T_full[mask, j * H:(j + 1) * H] = Y[mask]
-        print(f"  → Task {j} has {mask.sum().item()} samples")
-
-    B_block = model.B.permute(1, 2, 0).reshape(num_tasks * H, p).to(device)
+        mask = T == j
+        T_full[mask, j * H : (j + 1) * H] = y[mask]
+    B_block = model.B.permute(1, 2, 0).reshape(num_tasks * H, p).to(DEVICE)
     YB = T_full @ B_block
-    reg = lambda_reg * torch.eye(K.shape[1], device=K.device)
-
+    reg = params["lambda_reg"] * torch.eye(K.shape[1], device=K.device)
     A = torch.linalg.solve(K.T @ K + reg, K.T @ YB)
-    model.shared_basis.A = A.to(device)
+    model.shared_basis.A = A.to(DEVICE)
     G = K @ A
-
-    print(f"A.shape: {A.shape}, G.shape: {G.shape}")
-
-    # Step 2: Solve B
-    B = torch.zeros(p, num_tasks, H, device=device)
+    B = torch.zeros(p, num_tasks, H, device=DEVICE)
     for j in range(num_tasks):
-        mask = (T == j)
+        mask = T == j
         G_j = G[mask]
-        y_j = Y[mask]
-        GTG = G_j.T @ G_j + lambda_reg * torch.eye(p, device=device)
+        y_j = y[mask]
+        GTG = G_j.T @ G_j + params["lambda_reg"] * torch.eye(p, device=DEVICE)
         GTy = G_j.T @ y_j
         B[:, j] = torch.linalg.solve(GTG, GTy)
     model.B = B
-    print(f"B.shape: {B.shape}, B std per task: {[B[:, j].std().item() for j in range(num_tasks)]}")
-
-    # Step 3: Update L
-    if alternate_L:
-        B_concat = B.permute(1, 2, 0).reshape(num_tasks, -1)
-        cov = B_concat @ B_concat.T
-        eigvals, eigvecs = torch.linalg.eigh(cov)
-        top_eigvecs = eigvecs[:, -p:]
-        top_eigvals = eigvals[-p:]
-        model.L = top_eigvecs @ torch.diag(top_eigvals) @ top_eigvecs.T
-        print(f"Updated L with eigvals: {top_eigvals.tolist()}")
-
-    preds = model.predict_with_basis(G, T)
-    mse = F.mse_loss(preds, Y)
-    print(f"MSE: {mse.item():.6f}")
-    return mse.item()
+    return model
 
 
-def run_training_pipeline(csv_path, val_ratio=0.2, test_ratio=0.2, max_epochs=100, patience=10):
-    df = load_and_preprocess(csv_path)
-    train_df, val_df, test_df, scalers = split_by_task(df, val_ratio, test_ratio)
-    
-    train_data = LoadDataset(train_df, horizon=FORECAST_LEN)
-    val_data = LoadDataset(val_df, horizon=FORECAST_LEN)
-    test_data = LoadDataset(test_df, horizon=FORECAST_LEN)
+def predict_multitask(model, X_pred, task_ids_pred):
+    G_pred = model.shared_basis(X_pred)
+    preds = model.predict_with_basis(G_pred, task_ids_pred)
+    return preds
 
-    train_loader = DataLoader(train_data, batch_size=BATCH_SIZE, shuffle=False)
-    val_loader = DataLoader(val_data, batch_size=BATCH_SIZE)
-    test_loader = DataLoader(test_data, batch_size=BATCH_SIZE)
 
-    # 🧠 Use scaled X_train
-    task0_scaler = scalers[0]["feature_scaler"]
-    X_train_scaled = task0_scaler.transform(train_df[["time", "day_of_year", "day_type"]])
-    X_train = torch.tensor(X_train_scaled, dtype=torch.float32)
+def random_search_training(
+    csv_path,
+    val_ratio=0.2,
+    test_ratio=0.2,
+    lambda_grid=[1e-4, 1e-3, 1e-2],
+    p_grid=[4, 7, 14, 20],
+    sigma_t_grid=[2.0, 4.0, 6.0],
+    sigma_d_grid=[1.0, 2.0, 2.5, 3.5, 5.0],
+    n_trials=N_RANDOM_SEARCH,
+    device=DEVICE,
+):
+    # 1. Load data and split
+    Xdf, ydf = load_and_preprocess(
+        csv_path, selected_task_names=["mm254.csv", "mm79158.csv"]
+    )
+    X_train_df, y_train_df, X_val_df, y_val_df, X_test_df, y_test_df = split_by_task(
+        Xdf, ydf, val_ratio, test_ratio
+    )
+    kernel_features = ["time", "day_of_year", "day_type"]
 
-    num_tasks = df["task_id"].nunique()
-    model = MultiTaskOKL(X_train=X_train, num_tasks=num_tasks, horizon=FORECAST_LEN, p=100)
+    # 2. Prepare per-task scalers, scale y per task
+    train_task_ids = X_train_df["task_id"].values
+    val_task_ids = X_val_df["task_id"].values
+    test_task_ids = X_test_df["task_id"].values
+    scalers, y_train_scaled = fit_scalers_per_task(y_train_df.values, train_task_ids)
 
-    model.to(DEVICE)
+    # For val/test, always use train scalers!
+    def apply_scalers(y, task_ids, scalers):
+        y_scaled = np.zeros_like(y, dtype=np.float32)
+        for task in np.unique(task_ids):
+            idx = task_ids == task
+            if task in scalers:
+                y_scaled[idx] = scalers[task].transform(y[idx].reshape(-1, 1)).flatten()
+            else:
+                y_scaled[idx] = y[
+                    idx
+                ]  # fallback, shouldn't happen if tasks are aligned
+        return y_scaled
 
-    lambda_reg = 1e-3
-    # best_val_loss = float("inf")
-    # epochs_no_improve = 0
+    y_val_scaled = apply_scalers(y_val_df.values, val_task_ids, scalers)
+    y_test_scaled = apply_scalers(y_test_df.values, test_task_ids, scalers)
 
-    for epoch in range(max_epochs):
-        print(f"\n🚀 Starting Epoch {epoch+1}/{max_epochs}")
-        start_time = time.time()
-        avg_loss = train_model(model, train_loader, lambda_reg, DEVICE, epoch, alternate_L=True)
-        end_time = time.time()
+    # Convert all to torch tensors
+    def to_tensor(df):
+        return torch.tensor(df.values, dtype=torch.float32)
 
-        print(f"✅ Finished training epoch {epoch+1} in {end_time - start_time:.2f}s. Avg loss: {avg_loss:.6f}")
-        print(f"🔍 Evaluating on validation set...")
+    X_train = to_tensor(X_train_df[kernel_features])
+    X_val = to_tensor(X_val_df[kernel_features])
+    X_test = to_tensor(X_test_df[kernel_features])
+    y_train = torch.tensor(y_train_scaled, dtype=torch.float32)
+    y_val = torch.tensor(y_val_scaled, dtype=torch.float32)
+    y_test = torch.tensor(y_test_scaled, dtype=torch.float32)
+    train_task_ids = torch.tensor(train_task_ids, dtype=torch.long)
+    val_task_ids = torch.tensor(val_task_ids, dtype=torch.long)
+    test_task_ids = torch.tensor(test_task_ids, dtype=torch.long)
+    num_tasks = int(Xdf["task_id"].nunique())
 
-        model.eval()
-        val_loss = 0
-        with torch.no_grad():
-            for i, (X, y, task_ids) in enumerate(val_loader):
-                print(f"  [Val Batch {i+1}/{len(val_loader)}]")
-                X, y, task_ids = X.to(DEVICE), y.to(DEVICE), task_ids.to(DEVICE)
-                G = model.compute_shared_basis(X)
-                preds = model.predict_with_basis(G, task_ids)
-                val_loss += F.mse_loss(preds, y).item()
-        val_loss /= len(val_loader)
-
-        print(f"📉 Validation loss for epoch {epoch+1}: {val_loss:.6f}")
-        print(f"📋 Logging training/validation loss to CSV...")
-
-        log_loss_csv(
-            epoch, 
-            time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(start_time)),
-            time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(end_time)), 
-            avg_loss, 
-            val_loss, 
-            task_ids=range(num_tasks)
+    # 3. CSV log header
+    os.makedirs(os.path.dirname(METRICS_PATH), exist_ok=True)
+    with open(METRICS_PATH, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(
+            [
+                "type",
+                "lambda",
+                "p",
+                "sigma_t",
+                "sigma_d",
+                "MAE",
+                "MSE",
+                "RMSE",
+                "MAPE",
+                "R2",
+                "time",
+            ]
         )
 
-        log_metrics_csv(epoch, model, train_loader, DEVICE, scalers, 'train')
-        log_metrics_csv(epoch, model, val_loader, DEVICE, scalers, 'val')
+    best_val_mae = float("inf")
+    best_params = None
+    best_model = None
 
-        print(f"💾 Saving model for epoch {epoch+1}...")
-        torch.save(model, f"{MODEL_PATH}/model_epoch_{epoch+1}.pt")
+    # 4. Random search
+    for i in range(n_trials):
+        lambda_reg = random.choice(lambda_grid)
+        p = random.choice(p_grid)
+        sigma_t = random.choice(sigma_t_grid)
+        sigma_d = random.choice(sigma_d_grid)
+        params = {
+            "lambda_reg": lambda_reg,
+            "p": p,
+            "sigma_t": sigma_t,
+            "sigma_d": sigma_d,
+        }
+        start_time = time.time()
+        print(f"Random search trial {i+1}/{n_trials}: {params}")
 
-        # if val_loss < best_val_loss - 1e-4:
-        #     best_val_loss = val_loss
-        #     epochs_no_improve = 0
-        # else:
-        #     epochs_no_improve += 1
-        #     if epochs_no_improve >= patience:
-        #         print(f"Early stopping at epoch {epoch+1} — no improvement for {patience} epochs.")
-        #         break
+        # Train model on scaled y
+        model = fit_multitask_model(
+            X_train.to(device),
+            y_train.to(device),
+            train_task_ids.to(device),
+            num_tasks,
+            params,
+        )
+
+        # Predict and inverse-transform for metrics
+        with torch.no_grad():
+            y_val_pred_scaled = (
+                predict_multitask(model, X_val.to(device), val_task_ids.to(device))
+                .cpu()
+                .numpy()
+                .flatten()
+            )
+            y_val_true_scaled = y_val.cpu().numpy().flatten()
+            val_task_ids_np = val_task_ids.cpu().numpy()
+
+            # Inverse transform
+            y_val_pred = inverse_transform_per_task(
+                y_val_pred_scaled, val_task_ids_np, scalers
+            )
+            y_val_true = inverse_transform_per_task(
+                y_val_true_scaled, val_task_ids_np, scalers
+            )
+
+        end_time = time.time()
+        avg_metrics, _ = calculate_metrics_per_task(
+            y_val_true, y_val_pred, val_task_ids_np, end_time - start_time
+        )
+
+        # Log (append)
+        with open(METRICS_PATH, "a", newline="") as flog:
+            writer = csv.writer(flog)
+            writer.writerow(
+                ["val"]
+                + [
+                    lambda_reg,
+                    p,
+                    sigma_t,
+                    sigma_d,
+                    avg_metrics["MAE"],
+                    avg_metrics["MSE"],
+                    avg_metrics["RMSE"],
+                    avg_metrics["MAPE"],
+                    avg_metrics["R2"],
+                    end_time - start_time,
+                ]
+            )
+        if avg_metrics["MAE"] < best_val_mae:
+            best_val_mae = avg_metrics["MAE"]
+            best_params = params.copy()
+            best_model = model
+        print(f"Elapsed: {end_time-start_time:.2f}s\n")
+
+    print(f"\nBest parameters: {best_params}")
+    print(f"Best validation MAE: {best_val_mae:.6f}")
+    torch.save(best_model, f"{MODEL_PATH}/best_model.pt")
+
+    # 5. Evaluate on test set (inverse transform, per task)
+    with torch.no_grad():
+        y_test_pred_scaled = (
+            predict_multitask(best_model, X_test.to(device), test_task_ids.to(device))
+            .cpu()
+            .numpy()
+            .flatten()
+        )
+        y_test_true_scaled = y_test.cpu().numpy().flatten()
+        test_task_ids_np = test_task_ids.cpu().numpy()
+        y_test_pred = inverse_transform_per_task(
+            y_test_pred_scaled, test_task_ids_np, scalers
+        )
+        y_test_true = inverse_transform_per_task(
+            y_test_true_scaled, test_task_ids_np, scalers
+        )
+        avg_test_metrics, _ = calculate_metrics_per_task(
+            y_test_true, y_test_pred, test_task_ids_np, 0
+        )
+        save_predictions_per_task(
+            y_test_true,
+            y_test_pred,
+            test_task_ids_np,
+            out_path="logs/prediction_data.csv",
+        )
+
+    with open(METRICS_PATH, "a", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(
+            ["test"]
+            + [
+                best_params["lambda_reg"],
+                best_params["p"],
+                best_params["sigma_t"],
+                best_params["sigma_d"],
+                avg_test_metrics["MAE"],
+                avg_test_metrics["MSE"],
+                avg_test_metrics["RMSE"],
+                avg_test_metrics["MAPE"],
+                avg_test_metrics["R2"],
+                0,
+            ]
+        )
+
 
 if __name__ == "__main__":
-    with open(LOGS_PATH, "w", newline="") as f:
-        csv.writer(f).writerow(["task_id", "epoch", "epoch_start_time", "epoch_end_time", "train_loss", "val_loss"])
-
-
-    with open(METRICS_PATH, "w", newline="") as f:
-        csv.writer(f).writerow(['task_id', 'epoch', 'type', 'inference', 'MAE', 'MSE', 'RMSE', 'MAPE', 'R2', 'MDA', 'Spearman'])
-
-    run_training_pipeline("data/merged.csv", val_ratio=0.1, test_ratio=0.3, max_epochs=EPOCHS, patience=EPOCHS)
+    os.makedirs(MODEL_PATH, exist_ok=True)
+    os.makedirs("logs", exist_ok=True)
+    random_search_training(
+        "data/merged.csv",
+        val_ratio=0.1,
+        test_ratio=0.3,
+        lambda_grid=[1e-4, 1e-3, 1e-2],
+        p_grid=[4, 7, 14, 20],
+        sigma_t_grid=[2.0, 4.0, 6.0],
+        sigma_d_grid=[1.0, 2.0, 2.5, 3.5, 5.0],
+        n_trials=5,
+        device=DEVICE,
+    )
