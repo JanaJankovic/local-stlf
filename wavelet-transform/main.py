@@ -8,7 +8,7 @@ from util import evaluate_model
 
 # --- DEVICE SETUP ---
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-#DEVICE= torch.device("cpu")  # Force CPU for compatibility
+# DEVICE= torch.device("cpu")  # Force CPU for compatibility
 print(f"🚀 Using device: {DEVICE}")
 
 LOG_PATH = "logs/training_log.csv"
@@ -18,30 +18,29 @@ METRICS_PATH = "logs/training_eval.csv"
 # --- CONFIGURATION ---
 args = {
     "test": 0.3,  # test/val split ratio
-    "val": 0.1, 
-    "horizon": 8,      # horizon=8 only due to SWT even-length requirement.
+    "val": 0.1,
+    "horizon": 8,  # horizon=8 only due to SWT even-length requirement.
     "lookback": 24 * 14,
-    "epochs": 20,  
+    "epochs": 50,
     "batch_size": 64,
     "level": 3,  # user-defined max SWT level
-    "wavelet": "db2"
+    "wavelet": "db2",
 }
+
 
 def get_model():
     return SwtForecastingModel(
         input_size=1,
         time2vec_k=8,
-        #d_model=480, # Original paper uses 480, but it is too large for this dataset
         d_model=64,
-        #n_heads=12, # Original paper uses 12, but it is too large for this dataset
+        # n_heads=12, # Original paper uses 12, but it is too large for this dataset
         n_heads=2,
         d_ff=128,
         n_enc_layers=2,
         n_dec_layers=0,
-        forecast_steps=args['horizon'],
-        output_bands=len(X_train_tensors)
+        forecast_steps=args["horizon"],
+        output_bands=len(X_train_tensors),
     ).to(DEVICE)
-
 
 
 def train_model(train_loader, val_loader, ys, scalers_y, args):
@@ -49,13 +48,13 @@ def train_model(train_loader, val_loader, ys, scalers_y, args):
 
     y_train, y_val, _ = ys
 
-    epochs = args['epochs']
+    epochs = args["epochs"]
     # Paper uses RMSprop, but it has given unpromising results and is quite slow.
-    #optimizer = torch.optim.RMSprop(model.parameters(), lr=1e-3, momentum=0.9)
+    # optimizer = torch.optim.RMSprop(model.parameters(), lr=1e-3, momentum=0.9)
     optimizer = torch.optim.Adam(model.parameters(), lr=0.0005, weight_decay=0)
 
-    loss_fn = torch.nn.MSELoss()
-    #loss_fn = torch.nn.SmoothL1Loss() # experimental test
+    # loss_fn = torch.nn.MSELoss()
+    loss_fn = torch.nn.SmoothL1Loss()  # experimental test
 
     for epoch in range(epochs):
         start_time = datetime.now()
@@ -79,15 +78,27 @@ def train_model(train_loader, val_loader, ys, scalers_y, args):
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
-            #scheduler.step()
+            # scheduler.step()
 
             train_loss += loss.item() * y_stack.size(0)
 
-            print(f"\r - Batch {batch_idx+1}/{num_batches} - loss: {loss.item():.6f}", end='', flush=True)
-        
+            print(
+                f"\r - Batch {batch_idx+1}/{num_batches} - loss: {loss.item():.6f}",
+                end="",
+                flush=True,
+            )
+
         end_time = datetime.now()
-        
-        _, train_metrics = evaluate_model(model, train_loader, y_train, scalers_y[0], args['horizon'], data_type='train', wavelet='db2')
+
+        _, train_metrics = evaluate_model(
+            model,
+            train_loader,
+            y_train,
+            scalers_y[0],
+            args["horizon"],
+            data_type="train",
+            wavelet="db2",
+        )
         train_loss /= len(train_loader.dataset)
 
         # === Validation ===
@@ -107,27 +118,39 @@ def train_model(train_loader, val_loader, ys, scalers_y, args):
                 val_loss += loss.item() * y_stack.size(0)
 
         val_loss /= len(val_loader.dataset)
-        _, val_metrics = evaluate_model(model, val_loader, y_val, scalers_y[0], args['horizon'], data_type='val', wavelet='db2')
-        print(f"\n[Epoch {epoch+1:02d}] Train loss: {train_loss:.6f} | Val loss: {val_loss:.6f}")
+        _, val_metrics = evaluate_model(
+            model,
+            val_loader,
+            y_val,
+            scalers_y[0],
+            args["horizon"],
+            data_type="val",
+            wavelet="db2",
+        )
+        print(
+            f"\n[Epoch {epoch+1:02d}] Train loss: {train_loss:.6f} | Val loss: {val_loss:.6f}"
+        )
 
-        
-        with open(LOG_PATH, 'a', newline='') as f:
-            csv.writer(f).writerow([
-                start_time.strftime('%Y-%m-%d %H:%M:%S'),
-                end_time.strftime('%Y-%m-%d %H:%M:%S'),
-                epoch + 1,
-                train_loss,
-                val_loss
-            ])
+        with open(LOG_PATH, "a", newline="") as f:
+            csv.writer(f).writerow(
+                [
+                    start_time.strftime("%Y-%m-%d %H:%M:%S"),
+                    end_time.strftime("%Y-%m-%d %H:%M:%S"),
+                    epoch + 1,
+                    train_loss,
+                    val_loss,
+                ]
+            )
 
-        with open(METRICS_PATH, 'a', newline='') as f:
-            writer = csv.DictWriter(f, fieldnames=["epoch", "type", *train_metrics.keys()])
+        with open(METRICS_PATH, "a", newline="") as f:
+            writer = csv.DictWriter(
+                f, fieldnames=["epoch", "type", *train_metrics.keys()]
+            )
             writer.writerow({"epoch": epoch + 1, "type": "train", **train_metrics})
             writer.writerow({"epoch": epoch + 1, "type": "val", **val_metrics})
 
         torch.save(model, f"models/model_epoch_{epoch + 1}.pt")
     print("✅ Model saved.")
-
 
 
 if __name__ == "__main__":
@@ -136,15 +159,40 @@ if __name__ == "__main__":
     ES_CONTINUOUS = 0x80000000
     ES_SYSTEM_REQUIRED = 0x00000001
     ctypes.windll.kernel32.SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED)
-        # --- CONFIG ---
+    # --- CONFIG ---
 
-    with open(LOG_PATH, 'w', newline='') as f:
-        csv.writer(f).writerow(['start_epoch_time', 'end_epoch_time', 'epoch', 'train_loss', 'val_loss'])
+    with open(LOG_PATH, "w", newline="") as f:
+        csv.writer(f).writerow(
+            ["start_epoch_time", "end_epoch_time", "epoch", "train_loss", "val_loss"]
+        )
 
-    with open(METRICS_PATH, 'w', newline='') as f:
-        csv.writer(f).writerow(['epoch','type','inference','MAE','MSE','RMSE','MAPE','R2','MDA','Spearman'])
+    with open(METRICS_PATH, "w", newline="") as f:
+        csv.writer(f).writerow(
+            [
+                "epoch",
+                "type",
+                "inference",
+                "MAE",
+                "MSE",
+                "RMSE",
+                "MAPE",
+                "R2",
+                "MDA",
+                "Spearman",
+            ]
+        )
 
-    train_loader, val_loader, test_loader, ys, scalers_X, scalers_y, X_train_tensors, X_val_tensors, X_test_tensors = prepare_data(args)
+    (
+        train_loader,
+        val_loader,
+        test_loader,
+        ys,
+        scalers_X,
+        scalers_y,
+        X_train_tensors,
+        X_val_tensors,
+        X_test_tensors,
+    ) = prepare_data(args)
     train_model(train_loader, val_loader, ys, scalers_y, args)
     print("Training complete. Model saved as 'models/model.pth'.")
 
