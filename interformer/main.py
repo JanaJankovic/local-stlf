@@ -19,7 +19,7 @@ INPUT_LEN = 24 * 14  # e.g., 1 day hourly
 FORECAST_LEN = 1  # e.g., 12 hours
 QUANTILES = [0.1, 0.5, 0.9]
 TRIALS = 20
-EPOCHS = 20
+EPOCHS = 50
 BATCH_SIZE = 64
 LOGS_PATH = "logs/training_log.csv"
 METRICS_PATH = "logs/training_eval.csv"
@@ -35,9 +35,9 @@ torch.autograd.set_detect_anomaly(True)
 HYPERPARAM_SPACE = {
     "learning_rate": [1e-4, 1e-3, 1e-2],
     "clip_value": [0.1, 1, 10],
-    "batch_size": [64, 128, 256],
+    "batch_size": [128, 256, 512],
     "dropout": [0, 0.1, 0.3, 0.5],
-    "d_model": [32, 64, 128],
+    "d_model": [16, 32, 64],
     "num_layers": [1, 2, 4, 8],
     "num_heads": [1, 4, 8],
     "kernel_size": [2, 4, 6],
